@@ -1,0 +1,24 @@
+[Unit]
+Description=ConsoleRDP local greeter on %I (banner shown when an RDP user owns the seat)
+Documentation=https://github.com/wdaugherty/consolerdp
+After=systemd-user-sessions.service
+ConditionPathExists=/dev/%I
+
+[Service]
+ExecStart=/sbin/agetty --noclear --noissue --login-program=/usr/local/sbin/consolerdp-greeter-login %I linux
+Type=idle
+Restart=always
+RestartSec=1
+UtmpIdentifier=%I
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+StandardOutput=tty
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+
+[Install]
+WantedBy=multi-user.target

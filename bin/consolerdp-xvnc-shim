@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+"""ConsoleRDP Xvnc shim — sesman-compatible bridge to existing :0.
+
+Background
+----------
+``xrdp-sesexec`` (xrdp 0.10) launches whatever binary is named
+``Xvnc`` on PATH after PAM-authenticating the user. It then polls the
+new X11 display via ``waitforx`` (XOpenDisplay) for up to ten seconds
+and tells xrdp to RFB-connect to the rfbport it allocated.
+
+We can't simply replace Xvnc with x11vnc:
+
+  - sesexec polls display ``:N`` via ``waitforx``. x11vnc isn't an X
+    server; it can't satisfy that probe.
+  - if the probe fails sesexec aborts before xrdp ever connects.
+
+So we run **two** processes from this shim:
+
+  1. **Xvfb :N** — a 1×1 in-memory dummy X server. Nobody renders to
+     it; it exists solely to make ``waitforx`` succeed. We pass it
+     sesexec's ``-auth`` cookie so XOpenDisplay's MIT-MAGIC-COOKIE
+     check passes.
+
+  2. **x11vnc -display :0** — the real RFB stream. Listens on the
+     ``-rfbport`` sesexec gave us, authenticates clients with the
+     ``-rfbauth`` password file sesexec generated. This is what xrdp
+     actually proxies to the remote client.
+
+Lifecycle
+---------
+sesexec waits on the shim (the "Xvnc" PID). When x11vnc exits
+(client disconnects — x11vnc's default ``-once`` behavior), the shim
+tears Xvfb down and exits with x11vnc's status. sesexec then runs
+``pam_close_session``, which fires our release hook on the
+orchestrator daemon.
+
+The shim runs as the seat user; sesexec setuid()'d before exec.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import syslog
+import time
+from pathlib import Path
+from typing import Optional
+
+
+def _xauth_from_xorg_cmdline(uid: int) -> str:
+    """Extract -auth FILE from a running Xorg/Xwayland's cmdline.
+
+    SDDM (and gdm in some configs) generate a per-session random auth
+    file like /run/user/<uid>/xauth_AbCdEf and pass it to Xorg via
+    ``-auth``. That file — *not* ~/.Xauthority — is what grants access
+    to display :0. The most reliable way to discover it is to read the
+    X server process's argv directly.
+    """
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            st = (proc / "loginuid").read_text().strip()
+            # Match by uid where possible; otherwise check argv anyway.
+        except OSError:
+            st = ""
+        try:
+            data = (proc / "cmdline").read_bytes()
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+        if not data:
+            continue
+        argv = data.split(b"\x00")
+        argv0 = argv[0].decode(errors="ignore")
+        if not (argv0.endswith("Xorg") or argv0.endswith("Xwayland")
+                or argv0 == "X"):
+            continue
+        try:
+            owner = (proc / "status").read_text()
+        except OSError:
+            owner = ""
+        if f"Uid:\t{uid}" not in owner:
+            continue
+        decoded = [a.decode(errors="ignore") for a in argv]
+        for i, a in enumerate(decoded):
+            if a == "-auth" and i + 1 < len(decoded):
+                return decoded[i + 1]
+    return ""
+
+
+def discover_xauth(uid: int) -> str:
+    """Find an Xauthority file that grants access to display :0.
+
+    Probe order, in decreasing reliability:
+      1. The running Xorg/Xwayland process's ``-auth`` cmdline arg.
+      2. SDDM-style ``/run/user/<uid>/xauth_*``.
+      3. /run/user/<uid>/Xauthority (gdm style).
+      4. ~/.Xauthority (legacy fallback).
+    """
+    found = _xauth_from_xorg_cmdline(uid)
+    if found:
+        return found
+    user_run = Path(f"/run/user/{uid}")
+    if user_run.is_dir():
+        try:
+            for f in user_run.iterdir():
+                if f.name.startswith("xauth_"):
+                    return str(f)
+        except PermissionError:
+            pass
+    for c in (
+        f"/run/user/{uid}/Xauthority",
+        f"/run/user/{uid}/gdm/Xauthority",
+        os.path.expanduser("~/.Xauthority"),
+    ):
+        if os.path.exists(c):
+            return c
+    sddm_dir = Path("/var/run/sddm")
+    if sddm_dir.is_dir():
+        try:
+            for f in sddm_dir.iterdir():
+                return str(f)
+        except PermissionError:
+            pass
+    return ""
+
+
+def parse_display(s: Optional[str]) -> int:
+    if not s:
+        return 10
+    return int(s.lstrip(":"))
+
+
+def wait_for_display(display: int, timeout: float = 5.0) -> bool:
+    sock = f"/tmp/.X11-unix/X{display}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(sock):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def main(argv: list[str]) -> int:
+    syslog.openlog("consolerdp-xvnc-shim", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("display", nargs="?", default=":10")
+    p.add_argument("-auth", dest="auth")
+    p.add_argument("-rfbauth", dest="rfbauth")
+    p.add_argument("-rfbport", dest="rfbport", default="5910")
+    p.add_argument("-geometry", dest="geometry")
+    p.add_argument("-depth", dest="depth", default="24")
+    p.add_argument("-dpi", dest="dpi")
+    args, ignored = p.parse_known_args(argv[1:])
+
+    display_num = parse_display(args.display)
+    syslog.syslog(
+        syslog.LOG_INFO,
+        f"shim start: display=:{display_num} rfbport={args.rfbport} "
+        f"rfbauth={args.rfbauth or '-'} auth={args.auth or '-'} "
+        f"uid={os.getuid()} ppid={os.getppid()} "
+        f"ignored_argv={' '.join(ignored)[:120]}",
+    )
+
+    # Tie our lifetime to sesexec: if the parent goes away (e.g.
+    # systemd restarts xrdp-sesman), the kernel will send SIGTERM to
+    # us and the signal handler below tears down Xvfb + x11vnc. This
+    # prevents orphaned Xvfb processes squatting on display numbers
+    # across sesman restarts. PR_SET_PDEATHSIG is racy if the parent
+    # already died before this call, so we also re-check ppid below.
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            syslog.syslog(syslog.LOG_WARNING,
+                          f"prctl(PDEATHSIG) errno={ctypes.get_errno()}")
+    except Exception as exc:
+        syslog.syslog(syslog.LOG_WARNING, f"PDEATHSIG unavailable: {exc!r}")
+    if os.getppid() == 1:
+        syslog.syslog(syslog.LOG_ERR,
+                      "parent already exited (ppid=1); refusing to start")
+        return 1
+
+    uid = os.getuid()
+    # Discover the live Xorg/:0 Xauthority by reading the X server's
+    # argv directly. ``-auth guess`` would *also* work in theory but
+    # x11vnc's guess logic relies on environment vars sesexec strips.
+    xauth_zero = discover_xauth(uid)
+    if not xauth_zero:
+        syslog.syslog(
+            syslog.LOG_ERR,
+            f"could not discover Xauthority for uid={uid}. "
+            "Is an Xorg session active? Try: pgrep -af Xorg")
+        return 1
+    syslog.syslog(syslog.LOG_INFO, f"using xauth for :0: {xauth_zero}")
+
+    # ----- step 1: dummy Xvfb on :N to satisfy sesexec's waitforx ----- #
+    xvfb_argv = ["/usr/bin/Xvfb", f":{display_num}",
+                 "-screen", "0", "1x1x24",
+                 "-nolisten", "tcp"]
+    if args.auth:
+        xvfb_argv += ["-auth", args.auth]
+    syslog.syslog(syslog.LOG_INFO, "exec: " + " ".join(xvfb_argv))
+    try:
+        xvfb = subprocess.Popen(
+            xvfb_argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+    except FileNotFoundError:
+        syslog.syslog(syslog.LOG_ERR,
+                      "/usr/bin/Xvfb missing — install xvfb package")
+        return 127
+
+    if not wait_for_display(display_num, 5.0):
+        syslog.syslog(syslog.LOG_ERR,
+                      f"Xvfb :{display_num} did not appear")
+        try: xvfb.terminate()
+        except Exception: pass
+        return 1
+    syslog.syslog(syslog.LOG_INFO,
+                  f"Xvfb :{display_num} up (pid={xvfb.pid})")
+
+    # ----- step 2: x11vnc serving real :0 on the rfbport sesexec picked - #
+    x11vnc_argv = [
+        "/usr/bin/x11vnc",
+        "-display", ":0",
+        "-auth", xauth_zero,
+        "-rfbport", str(args.rfbport),
+        "-listen", "127.0.0.1",
+        "-localhost",          # bind only to loopback
+        "-shared",
+        "-nopw",               # see comment below
+        "-noxdamage",
+        "-noxrecord",
+        "-noxfixes",
+        # Default is "-once": exit after first client disconnects, so
+        # sesexec tears down the PAM session and our release hook fires.
+    ]
+    # NOTE on auth: sesman writes args.rfbauth as a TigerVNC-format
+    # password file (8 bytes, DES-obfuscated with the standard VNC
+    # fixed key). xrdp's libvnc.so then sends the user's password to
+    # us in the VNC handshake. Unfortunately xrdp's password
+    # derivation and x11vnc's `-rfbauth` parser disagree on
+    # padding/encoding subtleties, so the handshake fails with
+    # "Error connecting to user session" even when the human-readable
+    # passwords are identical. Since x11vnc binds only to 127.0.0.1
+    # via -listen/-localhost, we deliberately disable VNC auth: the
+    # only client that can reach us is xrdp's libvnc on the same
+    # box, and the real authn already happened upstream in PAM.
+    _ = args.rfbauth  # accepted for sesman compat but intentionally unused
+    syslog.syslog(syslog.LOG_INFO, "exec: " + " ".join(x11vnc_argv))
+    # Capture x11vnc's stderr so failures (XOpenDisplay, perms, etc.)
+    # land in the journal instead of being lost to sesexec's void.
+    try:
+        x11vnc = subprocess.Popen(
+            x11vnc_argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        syslog.syslog(syslog.LOG_ERR, "/usr/bin/x11vnc missing")
+        try: xvfb.terminate()
+        except Exception: pass
+        return 127
+
+    # Drain x11vnc's output to syslog in a background thread so we
+    # don't block on its pipe and so the journal captures errors.
+    import threading
+    def _pump_x11vnc_log() -> None:
+        if x11vnc.stdout is None:
+            return
+        for line in x11vnc.stdout:
+            line = line.rstrip()
+            if line:
+                syslog.syslog(syslog.LOG_INFO, "x11vnc: " + line[:500])
+    threading.Thread(target=_pump_x11vnc_log, daemon=True).start()
+
+    # ----- shutdown handler: sesexec sends SIGTERM on session end ----- #
+    def _shutdown(signum: int, _frame) -> None:
+        syslog.syslog(syslog.LOG_INFO,
+                      f"signal {signum} received — stopping children")
+        for proc in (x11vnc, xvfb):
+            if proc.poll() is None:
+                try: proc.terminate()
+                except Exception: pass
+        for proc in (x11vnc, xvfb):
+            try: proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try: proc.kill()
+                except Exception: pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGHUP, _shutdown)
+
+    rc = x11vnc.wait()
+    syslog.syslog(syslog.LOG_INFO,
+                  f"x11vnc exited rc={rc}; tearing down Xvfb")
+    if xvfb.poll() is None:
+        try:
+            xvfb.terminate(); xvfb.wait(timeout=3)
+        except Exception:
+            try: xvfb.kill()
+            except Exception: pass
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

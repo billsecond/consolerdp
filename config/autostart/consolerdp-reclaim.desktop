@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ConsoleRDP — local reclaim
+Comment=Tells the ConsoleRDP daemon that the desktop is now owned locally
+Exec=/usr/local/sbin/consolerdp-reclaim-self
+OnlyShowIn=KDE;GNOME;XFCE;LXQt;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

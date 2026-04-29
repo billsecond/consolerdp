@@ -1,0 +1,5 @@
+#!/bin/sh
+# consolerdp-reclaim-self — convenience wrapper used by the desktop
+# autostart entry. Tells the daemon to RECLAIM for the current user.
+# Idempotent: if no RDP session is active it's a no-op.
+exec /usr/local/sbin/consolerdp-ctl reclaim "${USER:-$(id -un)}"

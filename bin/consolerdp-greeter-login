@@ -1,0 +1,22 @@
+#!/bin/sh
+# consolerdp-greeter-login — login program invoked by agetty on the
+# greeter TTY. Prints a banner explaining the seat is in use remotely
+# and then drops to the standard /bin/login. After successful login,
+# this exits and PAM's session stack (with our hook) handles the
+# RECLAIM bookkeeping.
+set -eu
+
+clear || true
+cat <<'BANNER'
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │   ConsoleRDP — this seat is currently in use remotely.      │
+  │                                                             │
+  │   Log in below to reclaim the desktop. The remote user      │
+  │   will be disconnected immediately upon successful auth.    │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+BANNER
+exec /bin/login "$@"

@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+"""consolerdp-make-rdp — generate a .RDP profile file.
+
+Why this exists
+---------------
+xrdp does not support NLA (network-level authentication). When mstsc
+or any RDP client connects without inline credentials, xrdp shows its
+own login dialog *after* the connection is established. There's no
+way around this on the server side.
+
+What we *can* do is hand the user a `.RDP` profile that:
+
+  1. Pre-fills the username and the host address.
+  2. Sets ``prompt for credentials:i:0`` and
+     ``promptcredentialonce:i:1`` so mstsc collects the password once
+     and stashes it in Windows Credential Manager.
+  3. Sets the auto-logon flag so mstsc forwards those credentials
+     inline in the RDP handshake. ``enable_token_login=true`` in
+     xrdp.ini then bypasses the xrdp dialog entirely.
+
+After the first double-click, all subsequent connects skip both
+dialogs — same UX as connecting to a Windows host with saved
+credentials.
+
+We cannot embed the password itself: Windows uses DPAPI (per-user
+profile-key encrypted blob) and the encryption is unavailable from
+Linux. Letting mstsc prompt for it once is the simplest sound option.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+from pathlib import Path
+
+
+def best_host_address() -> str:
+    """Pick a non-loopback IP that's reachable on the LAN."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Doesn't actually send anything; just selects a route.
+        s.connect(("198.51.100.1", 1))  # TEST-NET-2
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return socket.gethostname()
+
+
+def render(host: str, user: str, port: int = 3389) -> str:
+    # https://learn.microsoft.com/windows-server/remote/remote-desktop-services/clients/rdp-files
+    return (
+        f"full address:s:{host}:{port}\r\n"
+        f"username:s:{user}\r\n"
+        "prompt for credentials:i:0\r\n"
+        "promptcredentialonce:i:1\r\n"
+        "screen mode id:i:2\r\n"
+        "use multimon:i:0\r\n"
+        "session bpp:i:32\r\n"
+        "compression:i:1\r\n"
+        "keyboardhook:i:2\r\n"
+        "audiocapturemode:i:0\r\n"
+        "videoplaybackmode:i:1\r\n"
+        "connection type:i:7\r\n"
+        "networkautodetect:i:1\r\n"
+        "bandwidthautodetect:i:1\r\n"
+        "displayconnectionbar:i:1\r\n"
+        "enableworkspacereconnect:i:0\r\n"
+        "disable wallpaper:i:0\r\n"
+        "allow font smoothing:i:1\r\n"
+        "allow desktop composition:i:0\r\n"
+        "disable full window drag:i:1\r\n"
+        "disable menu anims:i:1\r\n"
+        "disable themes:i:0\r\n"
+        "disable cursor setting:i:0\r\n"
+        "bitmapcachepersistenable:i:1\r\n"
+        "audiomode:i:0\r\n"
+        "redirectprinters:i:0\r\n"
+        "redirectlocation:i:0\r\n"
+        "redirectcomports:i:0\r\n"
+        "redirectsmartcards:i:0\r\n"
+        "redirectwebauthn:i:0\r\n"
+        "redirectclipboard:i:1\r\n"
+        "redirectposdevices:i:0\r\n"
+        "autoreconnection enabled:i:1\r\n"
+        "authentication level:i:0\r\n"
+        "negotiate security layer:i:1\r\n"
+        "enablecredsspsupport:i:0\r\n"  # xrdp doesn't speak CredSSP/NLA
+        "remoteapplicationmode:i:0\r\n"
+        "alternate shell:s:\r\n"
+        "shell working directory:s:\r\n"
+        "gatewayhostname:s:\r\n"
+        "gatewayusagemethod:i:4\r\n"
+        "gatewaycredentialssource:i:4\r\n"
+        "gatewayprofileusagemethod:i:0\r\n"
+        "promptcredentialonce:i:0\r\n"
+        "use redirection server name:i:0\r\n"
+        "rdgiskdcproxy:i:0\r\n"
+        "kdcproxyname:s:\r\n"
+    )
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Generate a .RDP profile for ConsoleRDP",
+    )
+    p.add_argument("--user", required=True,
+                   help="Linux user that owns the seat (matches /etc/consolerdp/consolerdp.conf 'user')")
+    p.add_argument("--host", default="",
+                   help="hostname or IP to embed (default: auto-detect)")
+    p.add_argument("--port", type=int, default=3389,
+                   help="RDP port (default 3389)")
+    p.add_argument("--out", default="",
+                   help="output path (default: ./consolerdp-<host>.rdp; "
+                        "use '-' for stdout)")
+    args = p.parse_args()
+
+    host = args.host or best_host_address()
+    text = render(host, args.user, args.port)
+
+    if args.out == "-":
+        sys.stdout.write(text)
+        return 0
+    out = args.out or f"consolerdp-{host}.rdp"
+    Path(out).write_text(text, encoding="utf-8")
+    os.chmod(out, 0o644)
+    sys.stderr.write(
+        f"Wrote {out}\n"
+        f"  host : {host}:{args.port}\n"
+        f"  user : {args.user}\n\n"
+        "Copy this file to your Windows machine and double-click it.\n"
+        "mstsc will prompt for the password once, then save it.\n"
+        "Future connections skip both the mstsc credentials dialog\n"
+        "AND the xrdp login screen.\n"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

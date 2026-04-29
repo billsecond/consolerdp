@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+# consolerdp-ctl — small CLI for ops & debugging.
+"""Usage:
+    consolerdp-ctl status
+    consolerdp-ctl ping
+    consolerdp-ctl reclaim <user>
+    consolerdp-ctl release <user>
+"""
+from __future__ import annotations
+import socket
+import sys
+
+SOCK = "/run/consolerdp.sock"
+
+
+def send(line: str) -> str:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5.0)
+    s.connect(SOCK)
+    s.sendall((line.rstrip("\n") + "\n").encode())
+    chunks: list[bytes] = []
+    while True:
+        b = s.recv(4096)
+        if not b:
+            break
+        chunks.append(b)
+    return b"".join(chunks).decode().strip()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__)
+        return 2
+    cmd = argv[1].lower()
+    if cmd in {"status", "ping"}:
+        print(send(cmd.upper()))
+        return 0
+    if cmd in {"reclaim", "release"} and len(argv) == 3:
+        print(send(f"{cmd.upper()} user={argv[2]}"))
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

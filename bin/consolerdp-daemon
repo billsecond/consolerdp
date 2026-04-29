@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+"""ConsoleRDP orchestrator daemon.
+
+Listens on a Unix socket (``/run/consolerdp.sock``) for short text
+commands issued by PAM hooks and the local-reclaim helper. Translates
+them into the privileged primitives required for Windows-style console
+takeover: ``chvt``, ``xinput`` enable/disable, ``x11vnc`` start/stop,
+``loginctl`` session lock.
+
+Run as root, normally under systemd. Single instance per machine.
+
+Protocol (newline-terminated UTF-8 lines on the socket):
+
+    TAKEOVER user=<name>          -> OK | ERR <reason>
+    RELEASE  user=<name>          -> OK | ERR <reason>
+    RECLAIM  user=<name>          -> OK | ERR <reason>
+    STATUS                        -> JSON state dump
+    PING                          -> PONG
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import logging
+import os
+import pwd
+import shlex
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+LOG = logging.getLogger("consolerdp")
+
+DEFAULT_CONF = "/etc/consolerdp/consolerdp.conf"
+DEFAULT_SOCK = "/run/consolerdp.sock"
+DEFAULT_VNC_PASSWD = "/etc/consolerdp/vnc.passwd"
+SOCK_GROUP = "xrdp"
+SOCK_MODE = 0o660
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Config:
+    user: str
+    console_tty: int
+    greeter_tty: int
+    bridge_listen: str
+    bridge_port: int
+    single_rdp: bool
+    lock_on_release: bool
+    vnc_passwd_file: str
+
+    @classmethod
+    def load(cls, path: str) -> "Config":
+        cp = configparser.ConfigParser()
+        if not cp.read(path):
+            raise FileNotFoundError(f"config file not found: {path}")
+        seat = cp["seat"]
+        bridge = cp["bridge"]
+        policy = cp["policy"]
+        return cls(
+            user=seat["user"].strip(),
+            console_tty=int(seat.get("console_tty", "1")),
+            greeter_tty=int(seat.get("greeter_tty", "8")),
+            bridge_listen=bridge.get("listen", "127.0.0.1"),
+            bridge_port=int(bridge.get("port", "5900")),
+            single_rdp=policy.getboolean("single_rdp", True),
+            lock_on_release=policy.getboolean("lock_on_release", True),
+            vnc_passwd_file=seat.get("vnc_passwd_file", DEFAULT_VNC_PASSWD),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Privileged primitives — wrapped for unit testing via dependency injection
+# --------------------------------------------------------------------------- #
+
+
+class System:
+    """Thin wrapper around the OS commands we invoke. Override in tests."""
+
+    def run(self, argv: list[str], *, check: bool = True,
+            env: Optional[dict] = None,
+            input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
+        LOG.debug("exec: %s", " ".join(shlex.quote(a) for a in argv))
+        return subprocess.run(
+            argv, check=check, env=env, input=input_bytes,
+            capture_output=True, timeout=30,
+        )
+
+    def chvt(self, tty: int) -> None:
+        self.run(["/usr/bin/chvt", str(tty)])
+
+    def list_sessions(self) -> list[dict]:
+        # systemd 254+ uses `--json=MODE`; older builds used
+        # `--output=json`. Try the new flag first, fall back if needed
+        # so we work on Ubuntu 22.04 (systemd 249) through 26.04+ (259).
+        cp = self.run(
+            ["/usr/bin/loginctl", "list-sessions", "--json=short"],
+            check=False,
+        )
+        if cp.returncode != 0:
+            cp = self.run(
+                ["/usr/bin/loginctl", "list-sessions", "--no-legend",
+                 "--output=json"],
+                check=False,
+            )
+        if cp.returncode != 0 or not cp.stdout:
+            return []
+        try:
+            return json.loads(cp.stdout)
+        except json.JSONDecodeError:
+            return []
+
+    def session_show(self, sid: str) -> dict:
+        cp = self.run(
+            ["/usr/bin/loginctl", "show-session", sid, "--value",
+             "-p", "Name", "-p", "Display", "-p", "TTY",
+             "-p", "Type", "-p", "State", "-p", "Active"],
+            check=False,
+        )
+        keys = ["Name", "Display", "TTY", "Type", "State", "Active"]
+        values = cp.stdout.decode().splitlines()
+        return dict(zip(keys, values + [""] * (len(keys) - len(values))))
+
+    def lock_session(self, sid: str) -> None:
+        self.run(["/usr/bin/loginctl", "lock-session", sid], check=False)
+
+    def xinput_set_all(self, *, enable: bool, display: str,
+                       xauth: str, run_as_uid: int) -> None:
+        env = {
+            "DISPLAY": display,
+            "XAUTHORITY": xauth,
+            "PATH": "/usr/bin:/bin",
+        }
+        cp = self.run(["/usr/bin/xinput", "list", "--id-only"],
+                      env=env, check=False)
+        if cp.returncode != 0:
+            LOG.warning("xinput list failed (rc=%s): %s",
+                        cp.returncode, cp.stderr.decode().strip())
+            return
+        ids = [i for i in cp.stdout.decode().split() if i.strip()]
+        verb = "enable" if enable else "disable"
+        for did in ids:
+            self.run(["/usr/bin/xinput", verb, did], env=env, check=False)
+
+    # NOTE: x11vnc is no longer started by the orchestrator. As of the
+    # sesman-driven flow it is launched per RDP session by the Xvnc
+    # shim (/usr/local/sbin/Xvnc → bin/consolerdp-xvnc-shim) so that
+    # xrdp-sesman's per-session RFB password is honored. The
+    # orchestrator only handles seat manipulation (VT/xinput/lock).
+
+
+# --------------------------------------------------------------------------- #
+# Daemon state
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class State:
+    rdp_active: bool = False
+    rdp_user: Optional[str] = None
+    rdp_session_id: Optional[str] = None
+    saved_console_tty: Optional[int] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+# --------------------------------------------------------------------------- #
+# Core orchestrator
+# --------------------------------------------------------------------------- #
+
+
+class Orchestrator:
+    def __init__(self, cfg: Config, sysd: Optional[System] = None) -> None:
+        self.cfg = cfg
+        self.sys = sysd or System()
+        self.state = State()
+
+    # -- helpers -----------------------------------------------------------
+
+    def _resolve_seat_session(self) -> Optional[dict]:
+        """Find the active local Xorg session owned by the seat user.
+
+        Wayland sessions are deliberately rejected here: x11vnc cannot
+        attach to a Wayland compositor's framebuffer, so a "successful"
+        takeover would leave the user staring at an Xwayland blank
+        canvas while the local screen is VT-switched away. Far better
+        to fail loudly with a clear remediation message.
+        """
+        try:
+            uid = pwd.getpwnam(self.cfg.user).pw_uid
+        except KeyError:
+            LOG.error("configured seat user %r does not exist", self.cfg.user)
+            return None
+        wayland_seen = False
+        for s in self.sys.list_sessions():
+            if int(s.get("uid", -1)) != uid:
+                continue
+            details = self.sys.session_show(s["session"])
+            active = details.get("Active") in {"yes", "true"}
+            stype = details.get("Type")
+            if not active:
+                continue
+            if stype == "x11":
+                details["Id"] = s["session"]
+                details["Uid"] = uid
+                return details
+            if stype == "wayland":
+                wayland_seen = True
+        if wayland_seen:
+            LOG.error(
+                "seat user %r has an active Wayland session, not Xorg. "
+                "ConsoleRDP requires Plasma (X11). Log out and pick "
+                "'Plasma (X11)' at SDDM, then retry.", self.cfg.user)
+        return None
+
+    def _xauth_for(self, uid: int) -> str:
+        """Best-effort discovery of the seat user's Xauthority file."""
+        candidates = [
+            f"/run/user/{uid}/gdm/Xauthority",
+            f"/run/user/{uid}/Xauthority",
+            f"/var/run/sddm/{{*}}",
+            os.path.expanduser(f"~{self.cfg.user}/.Xauthority"),
+        ]
+        for c in candidates:
+            if "*" in c:
+                continue
+            if os.path.exists(c):
+                return c
+        # SDDM uses random names — glob it.
+        sddm_dir = Path("/var/run/sddm")
+        if sddm_dir.is_dir():
+            for f in sddm_dir.iterdir():
+                return str(f)
+        raise FileNotFoundError(
+            f"could not locate Xauthority for uid={uid}")
+
+    # -- public API --------------------------------------------------------
+
+    def takeover(self, user: str) -> str:
+        with self.state.lock:
+            if user != self.cfg.user:
+                return f"ERR user {user!r} is not the configured seat owner"
+            if self.state.rdp_active:
+                if self.cfg.single_rdp:
+                    return "ERR another RDP session is already active"
+                # Boot the previous session before overwriting state.
+                self._tear_down_locked()
+
+            sess = self._resolve_seat_session()
+            if sess is None:
+                # _resolve_seat_session has already logged a precise
+                # reason (no session at all vs Wayland). Pass a short
+                # actionable hint back over the wire.
+                if any(
+                    int(s.get("uid", -1))
+                    == pwd.getpwnam(self.cfg.user).pw_uid
+                    for s in self.sys.list_sessions()
+                ):
+                    return ("ERR seat user has a Wayland session — "
+                            "log out and pick 'Plasma (X11)' at SDDM")
+                return "ERR no active local X session for seat user"
+            display = sess.get("Display") or ":0"
+            try:
+                xauth = self._xauth_for(sess["Uid"])
+            except FileNotFoundError as e:
+                return f"ERR {e}"
+
+            try:
+                self.sys.xinput_set_all(
+                    enable=False, display=display, xauth=xauth,
+                    run_as_uid=sess["Uid"],
+                )
+                self.sys.chvt(self.cfg.greeter_tty)
+            except Exception as e:  # noqa: BLE001
+                LOG.exception("takeover failed: %s", e)
+                # Best-effort rollback.
+                self.sys.xinput_set_all(
+                    enable=True, display=display, xauth=xauth,
+                    run_as_uid=sess["Uid"],
+                )
+                self.sys.chvt(self.cfg.console_tty)
+                return f"ERR takeover failed: {e}"
+
+            self.state.rdp_active = True
+            self.state.rdp_user = user
+            self.state.rdp_session_id = sess["Id"]
+            self.state.saved_console_tty = self.cfg.console_tty
+            LOG.info("takeover complete for user=%s display=%s tty->%d "
+                     "(x11vnc will be started by Xvnc shim)",
+                     user, display, self.cfg.greeter_tty)
+            return "OK"
+
+    def release(self, user: str) -> str:
+        with self.state.lock:
+            if not self.state.rdp_active:
+                return "OK"  # idempotent
+            if user and self.state.rdp_user and user != self.state.rdp_user:
+                return f"ERR release requested by {user!r} but session " \
+                       f"is owned by {self.state.rdp_user!r}"
+            self._tear_down_locked()
+            return "OK"
+
+    def reclaim(self, user: str) -> str:
+        # Local console reclaim: same primitive as release, but the local
+        # user has just authenticated at the greeter.
+        if user != self.cfg.user:
+            return f"ERR user {user!r} is not the configured seat owner"
+        return self.release(user)
+
+    def _tear_down_locked(self) -> None:
+        """Caller must hold self.state.lock."""
+        sess = self._resolve_seat_session()
+        if sess is not None:
+            try:
+                xauth = self._xauth_for(sess["Uid"])
+                self.sys.xinput_set_all(
+                    enable=True, display=sess.get("Display") or ":0",
+                    xauth=xauth, run_as_uid=sess["Uid"],
+                )
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("could not re-enable xinput: %s", e)
+            if self.cfg.lock_on_release and self.state.rdp_session_id:
+                self.sys.lock_session(self.state.rdp_session_id)
+        self.sys.chvt(self.state.saved_console_tty or self.cfg.console_tty)
+        self.state.rdp_active = False
+        self.state.rdp_user = None
+        self.state.rdp_session_id = None
+        self.state.saved_console_tty = None
+        LOG.info("released seat back to console")
+
+    def status(self) -> str:
+        with self.state.lock:
+            return json.dumps({
+                "rdp_active": self.state.rdp_active,
+                "rdp_user": self.state.rdp_user,
+                "rdp_session_id": self.state.rdp_session_id,
+                "config": {
+                    "user": self.cfg.user,
+                    "console_tty": self.cfg.console_tty,
+                    "greeter_tty": self.cfg.greeter_tty,
+                    "bridge": f"{self.cfg.bridge_listen}:{self.cfg.bridge_port}",
+                    "single_rdp": self.cfg.single_rdp,
+                    "lock_on_release": self.cfg.lock_on_release,
+                },
+            })
+
+
+# --------------------------------------------------------------------------- #
+# Unix socket server
+# --------------------------------------------------------------------------- #
+
+
+class _Handler(socketserver.StreamRequestHandler):
+    orch: Orchestrator  # type: ignore[assignment]  # set on subclass
+
+    def handle(self) -> None:
+        try:
+            line = self.rfile.readline().decode("utf-8", "replace").strip()
+        except Exception as e:  # noqa: BLE001
+            self.wfile.write(f"ERR malformed request: {e}\n".encode())
+            return
+        LOG.debug("request: %s", line)
+        reply = self._dispatch(line)
+        self.wfile.write((reply.rstrip("\n") + "\n").encode())
+
+    def _dispatch(self, line: str) -> str:
+        if not line:
+            return "ERR empty request"
+        parts = shlex.split(line)
+        cmd = parts[0].upper()
+        kv = {}
+        for tok in parts[1:]:
+            if "=" not in tok:
+                return f"ERR malformed token: {tok!r}"
+            k, v = tok.split("=", 1)
+            kv[k.lower()] = v
+        try:
+            if cmd == "PING":
+                return "PONG"
+            if cmd == "STATUS":
+                return self.orch.status()
+            user = kv.get("user", "")
+            if cmd == "TAKEOVER":
+                return self.orch.takeover(user)
+            if cmd == "RELEASE":
+                return self.orch.release(user)
+            if cmd == "RECLAIM":
+                return self.orch.reclaim(user)
+            return f"ERR unknown command: {cmd}"
+        except Exception as e:  # noqa: BLE001
+            LOG.exception("handler crashed")
+            return f"ERR internal: {e}"
+
+
+class _Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _make_socket(path: str) -> _Server:
+    if os.path.exists(path):
+        os.unlink(path)
+    server = _Server(path, _Handler)
+    try:
+        import grp
+        gid = grp.getgrnam(SOCK_GROUP).gr_gid
+        os.chown(path, 0, gid)
+    except KeyError:
+        LOG.warning("group %r not found; leaving socket owned by root:root",
+                    SOCK_GROUP)
+    os.chmod(path, SOCK_MODE)
+    return server
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="consolerdp-daemon")
+    p.add_argument("--config", default=DEFAULT_CONF)
+    p.add_argument("--socket", default=DEFAULT_SOCK)
+    p.add_argument("--log-level", default="INFO")
+    args = p.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    cfg = Config.load(args.config)
+    orch = Orchestrator(cfg)
+
+    handler_cls = type("Handler", (_Handler,), {"orch": orch})
+    if os.path.exists(args.socket):
+        os.unlink(args.socket)
+    server = _Server(args.socket, handler_cls)
+    try:
+        import grp
+        gid = grp.getgrnam(SOCK_GROUP).gr_gid
+        os.chown(args.socket, 0, gid)
+    except KeyError:
+        LOG.warning("group %r not found; socket left as root:root", SOCK_GROUP)
+    os.chmod(args.socket, SOCK_MODE)
+
+    stop = threading.Event()
+
+    def _term(signum: int, _frame) -> None:  # noqa: ANN001
+        LOG.info("signal %s received, shutting down", signum)
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, _term)
+    signal.signal(signal.SIGTERM, _term)
+
+    LOG.info("consolerdp-daemon listening on %s for seat user=%s",
+             args.socket, cfg.user)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        try:
+            os.unlink(args.socket)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

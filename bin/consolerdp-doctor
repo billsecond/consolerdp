@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+# consolerdp-doctor — preflight & runtime diagnostic for ConsoleRDP.
+"""Prints a colored OK/WARN/FAIL report for each precondition needed
+for ConsoleRDP to work end-to-end. Always exits 0 (it is informational).
+"""
+from __future__ import annotations
+
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+
+GREEN = "\033[1;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[1;31m"
+RESET = "\033[0m"
+
+
+def line(label: str, ok: bool | None, msg: str) -> None:
+    if ok is True:
+        tag = f"{GREEN}OK{RESET}  "
+    elif ok is False:
+        tag = f"{RED}FAIL{RESET}"
+    else:
+        tag = f"{YELLOW}WARN{RESET}"
+    print(f"  [{tag}] {label:<32} {msg}")
+
+
+def run(argv: list[str]) -> tuple[int, str]:
+    try:
+        cp = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        return cp.returncode, cp.stdout.strip() or cp.stderr.strip()
+    except FileNotFoundError:
+        return 127, "(not installed)"
+    except subprocess.TimeoutExpired:
+        return 124, "(timeout)"
+
+
+def _seat_user_from_config() -> str:
+    p = "/etc/consolerdp/consolerdp.conf"
+    try:
+        for raw in open(p):
+            s = raw.strip()
+            if s.startswith("user") and "=" in s:
+                return s.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def check_session_type() -> None:
+    # Prefer the env var when present (running as the user). Under sudo it's
+    # wiped, so fall back to loginctl for the configured seat user's active
+    # graphical session.
+    t = os.environ.get("XDG_SESSION_TYPE", "")
+    if t in {"x11", "wayland", "tty"}:
+        ok = (t == "x11")
+        line("session type", ok if t in {"x11", "wayland"} else None,
+             f"XDG_SESSION_TYPE={t}"
+             + (" — switch to 'Plasma (X11)' at SDDM" if t == "wayland" else ""))
+        return
+    user = _seat_user_from_config()
+    if not user:
+        line("session type", None, "could not determine (no config user)")
+        return
+    rc, out = run(["loginctl", "list-sessions", "--no-legend"])
+    if rc != 0:
+        line("session type", None, "loginctl unavailable")
+        return
+    sid = ""
+    for ln in out.splitlines():
+        cols = ln.split()
+        if len(cols) >= 3 and cols[2] == user:
+            sid = cols[0]; break
+    if not sid:
+        line("session type", None,
+             f"no active session for {user} (not logged in graphically?)")
+        return
+    rc2, props = run(["loginctl", "show-session", sid,
+                      "-p", "Type", "-p", "Active", "--value"])
+    parts = props.splitlines()
+    typ = parts[0] if parts else ""
+    if typ == "x11":
+        line("session type", True, f"{user}'s session is x11 (sid={sid})")
+    elif typ == "wayland":
+        line("session type", False,
+             f"{user}'s session is Wayland — log out & pick 'Plasma (X11)'")
+    else:
+        line("session type", None, f"{user}'s session type={typ or '?'}")
+
+
+def check_service(name: str) -> None:
+    rc, out = run(["systemctl", "is-active", name])
+    line(name, rc == 0, out or "?")
+
+
+def check_socket() -> None:
+    p = "/run/consolerdp.sock"
+    if not Path(p).exists():
+        line("socket", False, f"{p} missing")
+        return
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(p)
+        s.sendall(b"PING\n")
+        reply = s.recv(64).decode().strip()
+        s.close()
+        line("socket", reply == "PONG", f"{p} -> {reply}")
+    except (PermissionError, OSError) as e:
+        line("socket", None,
+             f"connectable but EACCES — add yourself to xrdp group: "
+             f"sudo adduser $USER xrdp ; newgrp xrdp ({e})")
+
+
+def check_listener(port: int) -> None:
+    rc, out = run(["ss", "-ltn", "sport", "=", f":{port}"])
+    listening = f":{port}" in out
+    line(f"tcp/{port} listener", listening,
+         "xrdp listening" if listening else "no listener on :3389")
+
+
+def check_firewall(port: int) -> None:
+    rc, out = run(["ufw", "status"])
+    if rc != 0:
+        line("ufw", None, "ufw not installed or not run as root")
+        return
+    if "inactive" in out.lower():
+        line("ufw", True, "inactive (no firewall blocking)")
+        return
+    if str(port) in out:
+        line("ufw", True, f"rule for {port}/tcp present")
+    else:
+        line("ufw", False,
+             f"active but no allow rule for {port}/tcp — "
+             f"sudo ufw allow {port}/tcp")
+
+
+def check_pkgs() -> None:
+    for pkg in ("xrdp", "x11vnc", "xinput", "kbd"):
+        rc, out = run(["dpkg-query", "-W", "-f=${Status}", pkg])
+        ok = rc == 0 and "install ok installed" in out
+        line(f"pkg {pkg}", ok, "installed" if ok else out or "(missing)")
+
+
+def check_config() -> None:
+    p = Path("/etc/consolerdp/consolerdp.conf")
+    if not p.exists():
+        line("config", False, f"{p} missing")
+        return
+    text = p.read_text()
+    if "REPLACE_ME" in text:
+        line("config", False,
+             "/etc/consolerdp/consolerdp.conf still has REPLACE_ME — "
+             "rerun install.sh --user <name>")
+    else:
+        line("config", True, str(p))
+
+
+def check_xsessions() -> None:
+    sessdir = Path("/usr/share/xsessions")
+    if not sessdir.is_dir():
+        line("X11 sessions", False, "/usr/share/xsessions missing")
+        return
+    sessions = sorted(sessdir.glob("*.desktop"))
+    if not sessions:
+        line("X11 sessions", False,
+             "no /usr/share/xsessions/*.desktop — install plasma-x11 or "
+             "kde-plasma-desktop")
+    else:
+        names = ", ".join(p.stem for p in sessions[:4])
+        line("X11 sessions", True, names)
+
+
+def check_vnc_passwd() -> None:
+    p = Path("/etc/consolerdp/vnc.passwd")
+    if not p.exists():
+        line("vnc bridge passwd", False, f"{p} missing")
+        return
+    try:
+        st = p.stat()
+        line("vnc bridge passwd", True,
+             f"{p} mode={oct(st.st_mode)[-3:]} size={st.st_size}")
+    except PermissionError:
+        line("vnc bridge passwd", None, f"{p} exists (no read perm)")
+
+
+def main() -> int:
+    print(f"\n{GREEN}ConsoleRDP doctor{RESET}\n")
+    print(" Preconditions ─────────────────────────────────────")
+    check_pkgs()
+    check_xsessions()
+    check_session_type()
+    print()
+    print(" Configuration ─────────────────────────────────────")
+    check_config()
+    check_vnc_passwd()
+    print()
+    print(" Runtime ───────────────────────────────────────────")
+    check_service("consolerdp.service")
+    check_service("xrdp.service")
+    check_service("xrdp-sesman.service")
+    check_service("consolerdp-greeter@tty8.service")
+    check_socket()
+    check_listener(3389)
+    check_firewall(3389)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

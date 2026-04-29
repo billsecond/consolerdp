@@ -1,0 +1,36 @@
+[Unit]
+Description=ConsoleRDP orchestrator (Windows-style RDP takeover for Linux)
+Documentation=https://github.com/wdaugherty/consolerdp
+After=systemd-logind.service network.target
+Wants=systemd-logind.service
+Before=xrdp.service
+PartOf=xrdp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/consolerdp-daemon \
+    --config /etc/consolerdp/consolerdp.conf \
+    --socket /run/consolerdp.sock \
+    --log-level INFO
+Restart=on-failure
+RestartSec=2s
+
+# We need root for chvt + xinput-as-other-user + x11vnc launch + lock.
+# But strip everything else.
+NoNewPrivileges=false
+ProtectSystem=strict
+ReadWritePaths=/run /var/log
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SYS_TTY_CONFIG CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_KILL
+
+[Install]
+WantedBy=multi-user.target

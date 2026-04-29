@@ -1,0 +1,65 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-startwm — placeholder window manager for ConsoleRDP.
+#
+# WHY THIS EXISTS
+# ---------------
+# When mstsc → xrdp → xrdp-sesman authenticates the user, sesman
+# starts an X server (our Xvnc shim) and *then* spawns the configured
+# DefaultWindowManager / UserWindowManager script with DISPLAY pointed
+# at the decoy display (:10). It treats the session as "in progress"
+# until that script exits.
+#
+# In the stock xrdp setup, that script is /etc/xrdp/startwm.sh which
+# runs `Xsession default` to spawn a full Plasma/GNOME desktop on the
+# fresh X server. ConsoleRDP doesn't want that — the user already has
+# their real Plasma session running on :0; the shim's x11vnc is
+# streaming THAT to the RDP client. We need the WM script to do
+# nothing visible and live exactly as long as the RDP session does.
+#
+# Lifecycle
+# ---------
+# 1. sesman spawns us with DISPLAY=:10 (the 1x1 decoy Xvfb the shim
+#    started).
+# 2. We loop polling the X server with `xset q`.
+# 3. The user disconnects RDP → x11vnc exits (our shim runs it
+#    "-once") → shim teardown sends SIGTERM to Xvfb → :10 dies.
+# 4. `xset q` starts failing → we exit 0 → sesman closes the PAM
+#    session → /etc/pam.d/xrdp-sesman pam_exec runs
+#    consolerdp-release → VT/keyboard reclaim happens.
+#
+# This script must work without any X clients beyond xset (provided
+# by x11-xserver-utils, which xrdp depends on transitively).
+
+set -u
+
+DISP="${DISPLAY:-:10}"
+LOG_TAG="consolerdp-startwm"
+
+log() {
+    /usr/bin/logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true
+}
+
+log "wm placeholder started (display=$DISP, user=${USER:-?}, uid=$(id -u 2>/dev/null))"
+
+# Tickle the takeover hook directly here too. The PAM ``pam_exec``
+# in /etc/pam.d/xrdp-sesman fires on session open, but if for any
+# reason that hook is skipped (e.g. PAM stack reordering during
+# distro upgrades), this is a defense-in-depth retry. The daemon
+# is idempotent: a second TAKEOVER for the same user is a no-op.
+if [[ -S /run/consolerdp.sock ]] && command -v socat >/dev/null 2>&1; then
+    {
+        printf 'TAKEOVER %s\n' "${PAM_USER:-${USER:-}}"
+    } | /usr/bin/socat -T2 - UNIX-CONNECT:/run/consolerdp.sock 2>/dev/null \
+      | /usr/bin/logger -t "$LOG_TAG" -- 2>/dev/null || true
+fi
+
+# Wait for the decoy X server to die (== user disconnected).
+# `xset q` is cheap and avoids spawning real X clients on a 1×1 display.
+while DISPLAY="$DISP" /usr/bin/xset q >/dev/null 2>&1; do
+    sleep 2
+done
+
+log "display $DISP went away — exiting (sesman will tear down the session)"
+exit 0

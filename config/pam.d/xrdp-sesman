@@ -1,0 +1,25 @@
+# /etc/pam.d/xrdp-sesman — ConsoleRDP variant.
+#
+# This file replaces the default xrdp-sesman PAM stack. Differences vs.
+# upstream:
+#   1. `pam_succeed_if` rejects any user other than the configured seat
+#      owner *before* prompting for credentials, so RDP cannot be used
+#      to enumerate accounts.
+#   2. `pam_exec` invokes our open/close hooks during session
+#      management, telling consolerdp-daemon to perform the takeover or
+#      release.
+#
+# To customize the seat owner, replace `SEAT_USER` below at install
+# time. The installer does this for you.
+
+@include common-auth
+auth     required   pam_succeed_if.so user = SEAT_USER quiet_success
+
+@include common-account
+account  required   pam_succeed_if.so user = SEAT_USER quiet_success
+
+@include common-session
+session  optional   pam_exec.so       /usr/local/sbin/consolerdp-takeover
+session  optional   pam_exec.so       /usr/local/sbin/consolerdp-release
+
+@include common-password

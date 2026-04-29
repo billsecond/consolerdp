@@ -1,0 +1,48 @@
+#!/bin/sh
+# consolerdp-takeover — invoked from /etc/pam.d/xrdp-sesman as a
+# session-stack hook (open_session). Sends a TAKEOVER request to the
+# orchestrator daemon over its Unix socket.
+#
+# PAM provides PAM_USER, PAM_TYPE, PAM_SERVICE, and PAM_RHOST in env.
+# We only act on open_session events; close_session is handled by the
+# companion script consolerdp-release.
+#
+# Exit code is intentionally always 0: PAM session failures must NOT
+# block the user from connecting if our orchestrator is unavailable —
+# stock xrdp behavior is preserved as a fallback.
+
+set -eu
+
+SOCK=/run/consolerdp.sock
+
+case "${PAM_TYPE:-}" in
+    open_session) ;;
+    *) exit 0 ;;
+esac
+
+USER="${PAM_USER:-}"
+[ -n "$USER" ] || exit 0
+
+# Require socat or python3 to talk to the daemon — both are common.
+talk() {
+    if command -v socat >/dev/null 2>&1; then
+        printf 'TAKEOVER user=%s\n' "$USER" \
+            | socat -T2 - "UNIX-CONNECT:$SOCK" || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$SOCK" "$USER" <<'PY' || true
+import socket, sys
+sock_path, user = sys.argv[1], sys.argv[2]
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2.0)
+    s.connect(sock_path)
+    s.sendall(f"TAKEOVER user={user}\n".encode())
+    print(s.recv(4096).decode().strip())
+except OSError as e:
+    print(f"consolerdp socket error: {e}", file=sys.stderr)
+PY
+    fi
+}
+
+talk | logger -t consolerdp-takeover
+exit 0
