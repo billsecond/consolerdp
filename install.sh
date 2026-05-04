@@ -123,6 +123,9 @@ ok "KDE Plasma is installed"
 # --------------------------------------------------------------------------- #
 step "2/6" "Installing runtime apt dependencies"
 
+# Note: there is no separate `plasma-remotedesktop` package on Plasma 6 /
+# Kubuntu 26.04. The System Settings RDP KCM (kcm_krdpserver.so) ships
+# inside the krdp .deb itself, which we install in step 4/6.
 APT_PACKAGES=(
     python3
     kbd
@@ -130,7 +133,6 @@ APT_PACKAGES=(
     sddm
     kwin-wayland
     plasma-workspace
-    plasma-remotedesktop
 )
 APT_ENV=(
     DEBIAN_FRONTEND=noninteractive

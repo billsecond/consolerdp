@@ -23,7 +23,6 @@ Depends:
  sddm,
 Recommends:
  ufw,
- plasma-remotedesktop,
 Description: Windows-style single-seat RDP takeover for Linux (Plasma 6 Wayland)
  ConsoleRDP orchestrates KDE's krdpserver so that a Linux workstation
  behaves like a Windows box with Remote Desktop enabled: one desktop,

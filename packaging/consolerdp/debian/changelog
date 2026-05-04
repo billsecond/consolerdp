@@ -1,3 +1,16 @@
+consolerdp (1.0.2) resolute; urgency=medium
+
+  * Bug fix: install.sh no longer asks apt to install
+    `plasma-remotedesktop`, which does not exist on Kubuntu 26.04 /
+    Plasma 6. The System Settings RDP KCM (kcm_krdpserver.so) ships
+    inside the patched krdp .deb itself, so no separate package is
+    needed. (Plasma-5-era leftover.)
+  * Removed the same `plasma-remotedesktop` Recommends from the
+    consolerdp .deb's debian/control.
+  * Updated INSTALL.md accordingly.
+
+ -- ConsoleRDP <consolerdp@local>  Mon, 04 May 2026 11:35:00 +0000
+
 consolerdp (1.0.1) resolute; urgency=medium
 
   * install.sh and install-remote.sh now reattach stdin to /dev/tty

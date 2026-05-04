@@ -66,10 +66,14 @@ The installer drops seven custom `.deb` packages from `release/`:
 | `krdp` | KDE's RDP server, patched with 8 fixes: NLA auth, fake-input authorization, virtual-monitor stream size, pointer motion fixes, pointer-to-global coordinate translation, deferred virtual monitor, Plasma clipboard bridge, color-range forwarding. |
 | `consolerdp` | Orchestrator daemon + helper scripts + systemd units + config templates. This is the glue that makes takeover / release / VT switching / session locking work. |
 
-And adds three apt packages for runtime:
+And adds these apt packages for runtime (only if missing):
 
-- `plasma-remotedesktop` (the KCM that configures `krdpserver`)
-- `kwin-wayland`, `plasma-workspace`, `sddm` (only if missing)
+- `plasma-workspace`, `kwin-wayland`, `sddm` (Plasma session bits)
+- `python3`, `kbd`, `util-linux` (orchestrator runtime)
+
+The System Settings RDP page (`kcm_krdpserver.so`) ships inside the
+patched `krdp` .deb itself, so there is no separate Plasma-side package
+to install — that was a Plasma-5-era split.
 
 ### What gets configured
 
