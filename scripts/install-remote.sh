@@ -63,9 +63,30 @@ echo
 
 # Sanity deps for downloading.  These should already be present on
 # Kubuntu but pin them in case of a minimal install.
-echo ">>> Refreshing apt index..."
-apt-get update -qq </dev/null
-apt-get install -y -qq curl jq tar </dev/null
+#
+# apt-get update may return non-zero on transient mirror problems
+# (IPv6 routing trouble, mirror sync in progress giving size-mismatch
+# errors, stale InRelease files). Those failures are almost always
+# benign for our purposes because (a) we only need three very common
+# utilities and (b) security.ubuntu.com's optional CNF cache file
+# being mis-sized doesn't affect the package archives we actually
+# download. So we tolerate apt-get-update warnings and only hard
+# fail if we genuinely can't install what we need.
+echo ">>> Refreshing apt index (non-fatal on mirror warnings)..."
+apt-get update -qq </dev/null || echo ">>> apt-get update had warnings -- continuing"
+
+missing=()
+for cmd in curl jq tar; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo ">>> Installing missing bootstrap deps: ${missing[*]}"
+    apt-get install -y -qq "${missing[@]}" </dev/null || {
+        echo "FATAL: could not install ${missing[*]} from apt" >&2
+        echo "Check /etc/apt/sources.list, IPv6 connectivity, and retry." >&2
+        exit 1
+    }
+fi
 
 # Resolve the tag (latest if unset).
 if [[ -z "$TAG" ]]; then

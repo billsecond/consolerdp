@@ -1,3 +1,18 @@
+consolerdp (1.0.4) resolute; urgency=medium
+
+  * Bug fix: install-remote.sh and install.sh no longer die when
+    `apt-get update` returns non-zero from transient mirror issues
+    (broken IPv6 routing to us.archive.ubuntu.com, mirror-sync
+    size mismatches in security.ubuntu.com's CNF cache, stale
+    InRelease files).  The update step now warns-and-continues;
+    we only hard-fail if a required utility genuinely can't be
+    installed, which is the actual failure mode we care about.
+  * install-remote.sh bootstrap deps (curl, jq, tar) are now only
+    installed if they're actually missing from PATH; the vast
+    majority of Kubuntu installs already have all three.
+
+ -- ConsoleRDP <consolerdp@local>  Mon, 04 May 2026 13:40:00 +0000
+
 consolerdp (1.0.3) resolute; urgency=medium
 
   * Fully automated RDP setup: install.sh now provisions everything

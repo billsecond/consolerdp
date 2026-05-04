@@ -146,7 +146,13 @@ APT_FLAGS=(
     -o Dpkg::Options::=--force-confdef
     -o Dpkg::Options::=--force-confold
 )
-env "${APT_ENV[@]}" apt-get update -qq </dev/null
+# apt-get update can return non-zero on transient mirror issues (broken
+# IPv6 routing, mirror syncing, stale InRelease).  We don't want that
+# to torpedo the install when the actual package archives are still
+# reachable, so we warn rather than fail.  The subsequent `apt-get
+# install` will hard-fail if anything is genuinely unreachable.
+env "${APT_ENV[@]}" apt-get update -qq </dev/null \
+    || warn "apt-get update had warnings (likely transient mirror issues) -- continuing"
 env "${APT_ENV[@]}" apt-get "${APT_FLAGS[@]}" install "${APT_PACKAGES[@]}" </dev/null
 ok "apt dependencies present"
 
