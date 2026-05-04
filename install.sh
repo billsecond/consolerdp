@@ -29,6 +29,15 @@
 set -euo pipefail
 
 # --------------------------------------------------------------------------- #
+# stdin self-heal: when invoked via `curl ... | sudo bash` the script's
+# stdin is the curl pipe, not the user's terminal.  Reattach stdin to
+# /dev/tty so prompts work correctly.
+# --------------------------------------------------------------------------- #
+if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
+    exec </dev/tty
+fi
+
+# --------------------------------------------------------------------------- #
 # arg parsing
 # --------------------------------------------------------------------------- #
 SEAT_USER=""

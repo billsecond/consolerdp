@@ -1,3 +1,16 @@
+consolerdp (1.0.1) resolute; urgency=medium
+
+  * install.sh and install-remote.sh now reattach stdin to /dev/tty
+    when invoked via `curl ... | sudo bash`, so prompts work even when
+    the original stdin is the curl pipe.
+  * Added a clearer "ConsoleRDP bootstrap" banner in install-remote.sh
+    so the user knows when the script has started.
+  * Recommended install pattern in INSTALL.md changed from
+    `curl | sudo bash` to "download then sudo bash <file>" because the
+    pipe pattern silently broke prompts on some terminals.
+
+ -- ConsoleRDP <consolerdp@local>  Mon, 04 May 2026 10:50:00 +0000
+
 consolerdp (1.0.0) resolute; urgency=medium
 
   * Initial public release.

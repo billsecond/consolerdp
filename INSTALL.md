@@ -8,12 +8,13 @@ Anything else (different Ubuntu version, GNOME, Plasma 5, X11, ARM) is
 
 ---
 
-## TL;DR — one command
+## TL;DR — two commands
 
 On a fresh Kubuntu 26.04 box, as the user you want to RDP into:
 
 ```bash
-curl -fsSL https://github.com/billsecond/consolerdp/releases/latest/download/install-remote.sh | sudo bash
+curl -fsSL https://github.com/billsecond/consolerdp/releases/latest/download/install-remote.sh -o /tmp/install-remote.sh
+sudo bash /tmp/install-remote.sh
 ```
 
 That script:
@@ -21,6 +22,14 @@ That script:
 1. Downloads the latest release tarball from GitHub.
 2. Unpacks it into `/opt/consolerdp-<version>/`.
 3. Runs `./install.sh --user $SUDO_USER`.
+
+> **Why two commands instead of `curl ... | sudo bash`?** Piping into `sudo bash`
+> attaches the script's stdin to the curl pipe, which silently breaks
+> any interactive prompt (sudo password prompt, y/n confirmations).
+> Downloading first, then running with `sudo bash`, leaves stdin
+> attached to your terminal so every prompt behaves normally. The
+> bootstrap script also tries to self-heal by reattaching `/dev/tty`,
+> but the two-command form is the reliable pattern.
 
 Once it finishes, from any Windows machine open **mstsc** and connect to
 the Linux host on port **3389** using your Linux user/password.
