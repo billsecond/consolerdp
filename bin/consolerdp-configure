@@ -203,19 +203,53 @@ EOF
     loginctl enable-linger "$SEAT_USER" >/dev/null 2>&1 || true
     ok "enabled linger for $SEAT_USER"
 
-    # If the user manager bus is up, start the unit now; otherwise
-    # it'll start on next Plasma login (Autostart=true takes care of
-    # that path) or on next boot (linger takes care of that path).
-    if [[ -S "/run/user/$uid/bus" ]]; then
-        sudo -u "$SEAT_USER" \
-            XDG_RUNTIME_DIR="/run/user/$uid" \
-            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            systemctl --user enable --now app-org.kde.krdpserver.service \
-            >/dev/null 2>&1 \
-            && ok "app-org.kde.krdpserver.service started" \
-            || warn "could not start app-org.kde.krdpserver.service yet (will start on next Plasma login)"
+    # After enable-linger, systemd starts user@$uid.service which
+    # creates /run/user/$uid/bus within ~1s.  Wait up to 5s for it
+    # before deciding "no user bus" -- otherwise we race against
+    # systemd and miss the window.
+    bus_path="/run/user/$uid/bus"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [[ -S "$bus_path" ]] && break
+        sleep 0.5
+    done
+
+    if [[ -S "$bus_path" ]]; then
+        # systemd 248+ accepts --machine=user@.host to address the
+        # user manager from root without faffing with XDG_RUNTIME_DIR;
+        # fall back to the older sudo -u + env vars pattern if that
+        # syntax isn't supported.
+        if systemctl --user --machine="$SEAT_USER@.host" daemon-reload >/dev/null 2>&1; then
+            systemctl --user --machine="$SEAT_USER@.host" \
+                enable --now app-org.kde.krdpserver.service \
+                >/dev/null 2>&1 \
+                && ok "app-org.kde.krdpserver.service enabled+started" \
+                || warn "app-org.kde.krdpserver.service could not start (try logging into Plasma)"
+        else
+            sudo -u "$SEAT_USER" \
+                XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+                systemctl --user enable --now app-org.kde.krdpserver.service \
+                >/dev/null 2>&1 \
+                && ok "app-org.kde.krdpserver.service enabled+started" \
+                || warn "app-org.kde.krdpserver.service could not start (try logging into Plasma)"
+        fi
+
+        # Verify it actually came up.  If not, surface the failure
+        # reason from journalctl so the user gets actionable info.
+        unit_state=$(systemctl --user --machine="$SEAT_USER@.host" \
+            is-active app-org.kde.krdpserver.service 2>/dev/null || \
+            sudo -u "$SEAT_USER" \
+                XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+                systemctl --user is-active app-org.kde.krdpserver.service \
+                2>/dev/null || echo unknown)
+        if [[ "$unit_state" == "active" ]]; then
+            ok "app-org.kde.krdpserver.service is running"
+        else
+            warn "app-org.kde.krdpserver.service is '$unit_state' -- it may need an active Plasma session to bind to KWin's screencast portal.  Log into Plasma once and retry."
+        fi
     else
-        warn "$SEAT_USER has no active user bus; krdpserver will start on their next Plasma login"
+        warn "user manager for $SEAT_USER did not come up after enable-linger; krdpserver will start on next Plasma login"
     fi
 fi
 

@@ -1,3 +1,33 @@
+consolerdp (1.0.5) resolute; urgency=medium
+
+  * Defensive .deb install: install.sh now uses --allow-downgrades
+    --reinstall --force-overwrite when installing the bundled .debs,
+    so apt is guaranteed to replace any stock-Kubuntu krdp /
+    kpipewire that happens to be present, even if its version
+    number is higher than ours.  Without this flag set, apt would
+    silently keep the stock package, the patches would not apply,
+    and the install would *appear* successful while mstsc still
+    failed at NLA.
+  * Per-package version verification: after the .deb install,
+    install.sh now confirms each of the 7 bundled packages is
+    actually installed at a version containing "+consolerdp" (or
+    is the consolerdp orchestrator itself).  Hard-fails with the
+    exact missing/wrong package name if not.
+  * consolerdp-configure step 7/8: now waits up to 5 seconds for
+    /run/user/$uid/bus to appear after `loginctl enable-linger`,
+    and prefers `systemctl --user --machine="$user@.host"` (the
+    systemd 248+ cross-user form) before falling back to the
+    sudo+env-vars pattern.  Verifies the unit actually came up
+    and reports its state, so failures aren't silent.
+  * Final-summary verification: install.sh's step 6/6 now
+    explicitly checks the KCM .so file, the patched krdp binary
+    marker, the consolerdp.service state, the krdpserverrc + TLS
+    cert provisioning, the 3389 listen socket, and the UFW rule.
+    Each is a separate ✓/! line so the user can see at a glance
+    what worked and what didn't.
+
+ -- ConsoleRDP <consolerdp@local>  Mon, 04 May 2026 14:40:00 +0000
+
 consolerdp (1.0.4) resolute; urgency=medium
 
   * Bug fix: install-remote.sh and install.sh no longer die when

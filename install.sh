@@ -146,6 +146,19 @@ APT_FLAGS=(
     -o Dpkg::Options::=--force-confdef
     -o Dpkg::Options::=--force-confold
 )
+# Extra flags ONLY for the local-.deb install step (3/6). We use
+# --allow-downgrades so apt will replace a stock Kubuntu krdp /
+# kpipewire that happens to have a higher version number than our
+# patched ones (e.g. if stock 26.04 ships 6.6.5 and our .debs are
+# 6.6.4-0ubuntu1+consolerdpN, apt would otherwise skip the install
+# silently and leave the system unpatched). force-overwrite handles
+# the case where another package owns one of the same files.
+DEB_INSTALL_FLAGS=(
+    "${APT_FLAGS[@]}"
+    --allow-downgrades
+    --reinstall
+    -o Dpkg::Options::=--force-overwrite
+)
 # apt-get update can return non-zero on transient mirror issues (broken
 # IPv6 routing, mirror syncing, stale InRelease).  We don't want that
 # to torpedo the install when the actual package archives are still
@@ -178,8 +191,30 @@ for d in "${DEBS[@]}"; do
 done
 
 # Install via apt-get to let it resolve and pull any missing dependencies.
-env "${APT_ENV[@]}" apt-get "${APT_FLAGS[@]}" install "${DEBS[@]}" </dev/null
+# Use DEB_INSTALL_FLAGS (with --allow-downgrades --reinstall --force-overwrite)
+# so apt is guaranteed to replace whatever stock packages are present,
+# even if their version number happens to be higher than ours.
+env "${APT_ENV[@]}" apt-get "${DEB_INSTALL_FLAGS[@]}" install "${DEBS[@]}" </dev/null
 ok ".debs installed"
+
+# Immediately verify each one actually landed at the expected patched
+# version.  Without this check, a silent skip would mean the user goes
+# all the way to the end of the install thinking it worked.
+for pkg in libkpipewire-data libkpipewire6 libkpipewirerecord6 \
+           libkpipewiredmabuf6 qml6-module-org-kde-pipewire krdp \
+           consolerdp; do
+    status=$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || echo "missing")
+    ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo "?")
+    if [[ "$status" != "install ok installed" ]]; then
+        fail "$pkg is not installed (status='$status'); see 'apt-get install' output above"
+    fi
+    # All ConsoleRDP-patched packages have a "+consolerdpN" version
+    # suffix (or are the consolerdp package itself, which is just 1.x).
+    if [[ "$pkg" != "consolerdp" && "$ver" != *consolerdp* ]]; then
+        fail "$pkg installed at $ver but expected a +consolerdp suffix.  Stock Kubuntu version is in place; the patched version was not applied."
+    fi
+    ok "$pkg $ver"
+done
 
 # --------------------------------------------------------------------------- #
 step "4/6" "Pinning ConsoleRDP packages against apt upgrades"
@@ -213,16 +248,61 @@ fi
 # --------------------------------------------------------------------------- #
 step "6/6" "Final sanity check"
 
+# Each of these is fail-loud: if the install hadn't really worked, we
+# want the user to see exactly what's broken on the last screenful of
+# install output rather than discover it later from mstsc errors.
+
+# 1. KCM .so file -- this is the System Settings "Remote Desktop" page.
+#    If it's missing, kcm_krdpserver wasn't shipped by the krdp .deb.
+KCM_SO=/usr/lib/x86_64-linux-gnu/qt6/plugins/plasma/kcms/systemsettings/kcm_krdpserver.so
+if [[ -f "$KCM_SO" ]]; then
+    ok "Remote Desktop KCM in place ($KCM_SO)"
+else
+    warn "KCM file MISSING at $KCM_SO -- System Settings will not show Remote Desktop"
+fi
+
+# 2. Patched krdp binary marker.  Our build embeds a build-info JSON
+#    string containing "consolerdp"; if the binary on disk has it,
+#    the patched build is what's executing.  If it doesn't, apt has
+#    silently kept a stock krdp in place and mstsc will fail at NLA.
+if strings /usr/bin/krdpserver 2>/dev/null | grep -q '"consolerdp'; then
+    ok "/usr/bin/krdpserver is the consolerdp-patched build"
+else
+    warn "/usr/bin/krdpserver is NOT the patched build -- mstsc will fail at NLA"
+fi
+
+# 3. consolerdp.service running.
 if systemctl is-active --quiet consolerdp.service; then
     ok "consolerdp.service: active"
 else
     warn "consolerdp.service is NOT active -- see 'journalctl -u consolerdp.service'"
 fi
 
+# 4. krdpserverrc + cert in place for the seat user.
+SEAT_HOME=$(getent passwd "$SEAT_USER" | cut -d: -f6)
+if [[ -s "$SEAT_HOME/.local/share/krdpserver/krdp.crt" \
+   && -s "$SEAT_HOME/.local/share/krdpserver/krdp.key" \
+   && -s "$SEAT_HOME/.config/krdpserverrc" ]] && \
+   grep -q SystemUserEnabled=true "$SEAT_HOME/.config/krdpserverrc" 2>/dev/null; then
+    ok "krdpserverrc + TLS cert provisioned for $SEAT_USER"
+else
+    warn "krdpserver config for $SEAT_USER incomplete -- consolerdp-configure step 7 may have skipped"
+fi
+
+# 5. Listening on 3389?
 if ss -tlnp 2>/dev/null | grep -q ':3389 '; then
     ok "krdpserver is listening on tcp/3389"
 else
-    warn "nothing listening on tcp/3389 yet -- log into Plasma once to start krdpserver"
+    warn "nothing listening on tcp/3389 yet -- log into Plasma once and re-check (Autostart=true will handle it)"
+fi
+
+# 6. UFW rule (if active).
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    if ufw status 2>/dev/null | grep -qE '^3389/tcp\s+ALLOW'; then
+        ok "ufw allows 3389/tcp"
+    else
+        warn "ufw is active but 3389/tcp is NOT allowed -- run 'sudo ufw allow 3389/tcp'"
+    fi
 fi
 
 echo
@@ -235,8 +315,15 @@ echo "  Greeter TTY   : tty${GREETER_TTY}"
 echo "  RDP listener  : tcp/3389"
 echo "  Host IPs      : $(hostname -I 2>/dev/null | tr -s ' ' || echo '?')"
 echo
-echo "From a Windows box, open mstsc and connect to one of those IPs."
-echo "Use the SAME Linux password you use at the SDDM greeter."
+echo "================================================================"
+echo " Connect from Windows mstsc:"
+echo "   host     : <one of the IPs above>:3389"
+echo "   username : $SEAT_USER"
+echo "   password : $SEAT_USER's Linux password (same as SDDM/sudo)"
+echo
+echo " mstsc will warn about the self-signed cert on first connect."
+echo " Tick 'Don't ask again for this computer' and you're done."
+echo "================================================================"
 echo
 echo "Diagnostics:"
 echo "  sudo consolerdp-doctor"
