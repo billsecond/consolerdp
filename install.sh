@@ -133,6 +133,7 @@ APT_PACKAGES=(
     sddm
     kwin-wayland
     plasma-workspace
+    openssl   # consolerdp-configure uses it to generate the krdpserver TLS cert
 )
 APT_ENV=(
     DEBIAN_FRONTEND=noninteractive

@@ -1,3 +1,24 @@
+consolerdp (1.0.3) resolute; urgency=medium
+
+  * Fully automated RDP setup: install.sh now provisions everything
+    needed for mstsc to work on first connect, no manual KCM step
+    required.  consolerdp-configure step 7/8 now:
+      - generates a self-signed RSA-2048 TLS cert (10-year validity)
+        in ~/.local/share/krdpserver/ if missing,
+      - writes ~/.config/krdpserverrc with SystemUserEnabled=true so
+        the patched krdp uses PAM for auth (Linux password = RDP
+        password),
+      - enable-linger's the seat user so the user manager survives
+        reboots,
+      - enables and starts app-org.kde.krdpserver.service.
+  * install.sh adds 'openssl' to APT_PACKAGES (needed for cert gen,
+    already present on stock Kubuntu but pinning it for minimal
+    images).
+  * INSTALL.md updated to document the new "What gets configured"
+    list and remove the manual System Settings step.
+
+ -- ConsoleRDP <consolerdp@local>  Mon, 04 May 2026 12:08:00 +0000
+
 consolerdp (1.0.2) resolute; urgency=medium
 
   * Bug fix: install.sh no longer asks apt to install
