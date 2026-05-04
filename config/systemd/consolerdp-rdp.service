@@ -1,0 +1,67 @@
+[Unit]
+Description=ConsoleRDP RDP server (freerdp-shadow-cli, NLA + SAM)
+Documentation=man:freerdp-shadow-cli(1)
+# We do NOT depend on graphical.target / ConditionPath checks here.
+# The lifecycle is owned by consolerdp.service which calls
+# `systemctl start consolerdp-rdp.service` when it observes that
+# the seat user has an active X11 login session, and `systemctl stop`
+# when not. This keeps all the policy logic in one place (the
+# Python daemon) instead of split between systemd directives and code.
+After=consolerdp.service
+PartOf=consolerdp.service
+# If consolerdp.service stops/restarts, we go with it.
+BindsTo=consolerdp.service
+
+# Avoid a tight crash loop if e.g. the SAM file is missing or no
+# X11 session is up yet (Restart=on-failure + RestartSec=3 means
+# we'd otherwise burn through systemd's default rate limit and
+# wedge the service in failed state).
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# These two are rewritten by install.sh via `sed -i` so the service
+# file matches the seat user actually configured in
+# /etc/consolerdp/consolerdp.conf. The placeholder defaults work
+# only on Kubuntu's typical first-account uid 1000.
+User=@SEAT_USER@
+Group=@SEAT_USER@
+
+# A login session for the user must already exist on this seat
+# before shadow-cli can capture it. The wrapper checks `xset q`
+# and exits non-zero if X11 isn't actually live; systemd then
+# restarts us at RestartSec, so we'll naturally retry while the
+# user is mid-login at SDDM.
+ExecStart=/usr/local/sbin/consolerdp-rdp-wrapper
+
+# Non-zero exit → restart. We don't restart on signals (SIGTERM
+# from `systemctl stop` is intentional and means the daemon told
+# us to shut down).
+Restart=on-failure
+RestartSec=3
+
+# Hardening: shadow-cli only needs to talk to X11 (Unix socket)
+# and bind 0.0.0.0:3389. It must read /etc/consolerdp/sam (mode
+# 0640 root:<seatgroup>) and the user's Xauthority. Everything
+# else is locked down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+
+# Logging: the eventer reads the journal (NOT stdout) so it can
+# track events even across service restarts.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=consolerdp-rdp
+
+[Install]
+WantedBy=multi-user.target

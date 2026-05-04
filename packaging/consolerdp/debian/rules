@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+# debian/rules for the consolerdp package.
+# We deliberately keep this minimal: dh_auto_build/install/test are
+# all no-ops because this is a pure script bundle -- there is
+# nothing to compile.
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+# Nothing to build: the scripts are already runnable.
+override_dh_auto_build:
+
+# Nothing to test here; the Python smoke tests run from the source
+# tree (tests/smoke.py) and require the daemon script in its
+# original bin/ layout, not the installed one.
+override_dh_auto_test:
+
+# dh_install reads debian/consolerdp.install and copies each source
+# path into debian/consolerdp/<destination>. Nothing custom.
+override_dh_auto_install:
+	dh_auto_install
+
+# Keep the conffile comment machinery happy -- the postinst runs
+# the installer wizard the first time (creates /etc/consolerdp
+# dir, drops the example config if absent). No rewrite on upgrade.
+override_dh_installsystemd:
+	# enable consolerdp.service by default
+	dh_installsystemd --name=consolerdp
+	# greeter tty unit stays disabled by default; operator chooses
+	# the tty at install time via consolerdp-configure
+	dh_installsystemd --no-enable --no-start --name=consolerdp-greeter@
+	# user-level session-watcher.service is shipped in /lib/systemd/user/
+	# via debian/consolerdp.install. It is NOT enabled at package-install
+	# time (users enable it via `systemctl --user enable` or via
+	# consolerdp-configure). dh_installsystemd has no --user flag on
+	# debhelper 13, so we rely on dh_install for this one.

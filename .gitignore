@@ -11,10 +11,40 @@ htmlcov/
 dist/
 build/
 
+# Upstream source trees unpacked into the repo root for patch dev.
+# These live in build/ after `apt source` or `dget`.
+kpipewire-*/
+krdp-*/
+kwin-*/
+
+# Upstream source tarballs + debian.* artefacts (too big for git,
+# and we already ship the patches/ to rebuild).
+*.orig.tar.xz
+*.orig.tar.gz
+*.debian.tar.xz
+*.dsc
+*.buildinfo
+*.changes
+*.ddeb
+
+# Local working snapshots (tarball backups of WIP states).
+# Never useful to consumers; never publish.
+snapshots/
+
+# Binary .debs are produced by build/ -> release/ and go to GitHub
+# Releases, not the repo. Track release/ so consumers can see what
+# the published bundle contains.
+release/*.deb
+
 # Local secrets — must never be committed
 config/vnc.passwd
 *.pem
 *.key
+
+# Runtime / scratch
+/tmp/
+*.log
+progress.txt
 
 # OS noise
 .DS_Store

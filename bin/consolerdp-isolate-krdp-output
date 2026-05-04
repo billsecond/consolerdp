@@ -1,0 +1,159 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-isolate-krdp-output -- isolate the KRdp virtual output so
+# Plasma reflows panels, wallpaper, and windows onto it.
+#
+# THE PROBLEM
+# -----------
+# Plasma assigns a containment (panel + wallpaper + widgets) to every
+# enabled output and tracks it by the output's UUID. When mstsc
+# connects, KRdp creates a brand-new virtual output with a fresh UUID
+# -- so Plasma builds a fresh containment for it (default wallpaper,
+# no panel, no widgets) instead of mirroring the user's real desktop
+# from Virtual-1. Worse, the user's actual panel and windows stay on
+# Virtual-1 (which is parked on tty2, hidden by the greeter), so
+# nothing the user does in mstsc lands on a useful surface.
+#
+# THE FIX
+# -------
+# Disable every output that the user *can't* see -- the physical
+# Virtual-1 and any leftover xdg-desktop-portal-kde "Virtual-virtual-*"
+# output -- leaving only the KRdp virtual enabled. KWin reacts by
+# evicting all containments and windows from the disabled outputs
+# onto the only remaining one. Plasma's primary-screen logic then
+# elects the KRdp virtual as primary, so the panel reseats there;
+# windows the user had open re-home to it; and on Plasma 6 the
+# wallpaper containment is migrated rather than recreated, so the
+# user's actual wallpaper follows.
+#
+# SAFETY
+# ------
+# Output configuration changes survive a crash, so a buggy run could
+# leave the user permanently looking at a black screen. To avoid that
+# this script:
+#
+#   * Snapshots the list of outputs it disables before touching
+#     anything (``DISABLED_BY_US`` array).
+#   * Installs a trap that re-enables exactly those outputs on EXIT,
+#     INT, TERM, HUP, or QUIT -- even if the script is killed or the
+#     terminal is closed.
+#   * Polls for the KRdp virtual once a second; the moment it goes
+#     away (mstsc disconnected and KRdp tore the stream down), we
+#     re-enable everything and exit cleanly.
+#   * Has an absolute time limit (configurable; default 8h) after
+#     which we restore even if the KRdp virtual is still up.
+#
+# USAGE
+#   consolerdp-isolate-krdp-output             # connect mstsc first
+#   consolerdp-isolate-krdp-output --max-h 4   # cap at 4 hours
+#
+# The intended workflow is "start mstsc, then start this script", or
+# the reverse with ``--wait`` -- the script will spin until a KRdp
+# virtual appears.
+
+set -euo pipefail
+
+WAIT_FOR_KRDP=0
+MAX_HOURS=8
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --wait)        WAIT_FOR_KRDP=1; shift ;;
+        --max-h)       MAX_HOURS="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '1,/^set -euo/p' "$0" | sed -n 's/^# \?//p'
+            exit 0 ;;
+        *)
+            echo "unknown option: $1" >&2; exit 64 ;;
+    esac
+done
+
+OUTPUT_TOOL=/usr/bin/consolerdp-output
+if [[ ! -x "$OUTPUT_TOOL" ]]; then
+    echo "missing $OUTPUT_TOOL" >&2; exit 1
+fi
+
+# Match the KRdp virtual by name. KWin prefixes our virtual with
+# "Virtual-" on the wl_output side, so the live name looks like
+# "Virtual-KRDP-virtual-<W>x<H>". Be tolerant of either form.
+is_krdp_output() {
+    [[ "$1" =~ (^|-)KRDP-virtual- ]]
+}
+
+list_enabled() {
+    "$OUTPUT_TOOL" list 2>/dev/null \
+      | awk '/ENABLED/ {print $1}'
+}
+
+find_krdp() {
+    list_enabled | while read -r name; do
+        if is_krdp_output "$name"; then
+            echo "$name"
+            return
+        fi
+    done
+}
+
+DISABLED_BY_US=()
+
+restore() {
+    if [[ "${#DISABLED_BY_US[@]}" -eq 0 ]]; then
+        return
+    fi
+    echo "consolerdp-isolate: restoring outputs: ${DISABLED_BY_US[*]}" >&2
+    for name in "${DISABLED_BY_US[@]}"; do
+        "$OUTPUT_TOOL" enable "$name" >/dev/null 2>&1 || true
+    done
+    DISABLED_BY_US=()
+}
+
+trap 'restore' EXIT INT TERM HUP QUIT
+
+# ----- find KRdp virtual -----------------------------------------
+KRDP=$(find_krdp || true)
+if [[ -z "$KRDP" && "$WAIT_FOR_KRDP" -eq 1 ]]; then
+    echo "consolerdp-isolate: waiting for a KRdp virtual output..." >&2
+    for _ in $(seq 1 120); do
+        sleep 1
+        KRDP=$(find_krdp || true)
+        [[ -n "$KRDP" ]] && break
+    done
+fi
+if [[ -z "$KRDP" ]]; then
+    echo "consolerdp-isolate: no KRdp virtual output present; connect mstsc first or pass --wait" >&2
+    exit 2
+fi
+echo "consolerdp-isolate: target = $KRDP" >&2
+
+# ----- disable everything else -----------------------------------
+while read -r name; do
+    [[ -z "$name" ]] && continue
+    [[ "$name" == "$KRDP" ]] && continue
+    echo "consolerdp-isolate: disabling $name" >&2
+    if "$OUTPUT_TOOL" disable "$name" >/dev/null 2>&1; then
+        DISABLED_BY_US+=("$name")
+    else
+        echo "consolerdp-isolate: WARNING failed to disable $name" >&2
+    fi
+done < <(list_enabled)
+
+if [[ "${#DISABLED_BY_US[@]}" -eq 0 ]]; then
+    echo "consolerdp-isolate: nothing else to disable, exiting clean" >&2
+    exit 0
+fi
+
+# ----- watch loop ------------------------------------------------
+DEADLINE=$(( $(date +%s) + MAX_HOURS * 3600 ))
+echo "consolerdp-isolate: watching $KRDP (max ${MAX_HOURS}h). Ctrl-C to restore early." >&2
+while true; do
+    sleep 1
+    if [[ -z "$(find_krdp)" ]]; then
+        echo "consolerdp-isolate: KRdp virtual gone (mstsc disconnected) -- restoring" >&2
+        break
+    fi
+    if (( $(date +%s) >= DEADLINE )); then
+        echo "consolerdp-isolate: max-h reached -- restoring" >&2
+        break
+    fi
+done
+# trap on EXIT does the restore

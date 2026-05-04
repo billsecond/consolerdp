@@ -1,0 +1,199 @@
+#!/bin/bash
+#
+# consolerdp-output-test -- run a controlled test of disable-physical against
+# a live mstsc session, with full state capture and auto-recovery.
+#
+# Flow:
+#   1. Wait until mstsc is actually connected (TCP :3389 ESTABLISHED + krdp
+#      reports "Video stream initialized" in its user-journal).
+#   2. Snapshot the wayland output list (now includes the new live virtual).
+#   3. Call disable-physical -- our updated code now bundles the
+#      set_primary_output() into the same atomic configuration so KWin will
+#      no longer reject the transition with "the primary output cannot be
+#      disabled".
+#   4. Sleep WAIT_SECS so the user can look at mstsc.
+#   5. Re-enable physical (also sets primary back to physical).
+#   6. Capture krdp + kwin journals over the whole window.
+#   7. Ask 4 debrief questions; answers are written to the same log.
+#
+# Output:
+#   /tmp/consolerdp-output-test.log     (everything, including stderr)
+#
+# Knobs (env vars):
+#   WAIT_SECS=30      how long to keep physical disabled (default 30s)
+#   TIMEOUT_SECS=120  how long to wait for mstsc to connect (default 120s)
+#
+# Run as the desktop user (wdaugherty), not root. consolerdp-output
+# auto-detects XDG_RUNTIME_DIR.
+
+set -u
+
+LOG=/tmp/consolerdp-output-test.log
+WAIT_SECS=${WAIT_SECS:-30}
+TIMEOUT_SECS=${TIMEOUT_SECS:-120}
+
+# Truncate so the agent only sees the most recent run.
+: > "$LOG"
+
+# Mirror everything to log AND console.
+exec > >(tee -a "$LOG") 2>&1
+
+stage() {
+    echo
+    echo "================================================================================"
+    echo "[$(date -Iseconds)] $*"
+    echo "================================================================================"
+}
+
+# Safety: regardless of how this script exits (Ctrl+C, kill, normal completion),
+# always try to put physical back on. enable-physical is a no-op if nothing was
+# disabled, so calling it unconditionally is safe.
+cleanup() {
+    echo
+    stage "CLEANUP: forcing physical re-enable (trap)"
+    /usr/bin/consolerdp-output enable-physical 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+stage "consolerdp-output-test starting"
+echo "wait_secs=$WAIT_SECS"
+echo "timeout_secs=$TIMEOUT_SECS"
+echo "id=$(id)"
+echo "tty=$(tty 2>&1 || true)"
+echo "host=$(hostname)"
+
+# ---------------------------------------------------------------------------
+# Phase 1: wait for mstsc to actually establish a session
+# ---------------------------------------------------------------------------
+
+stage "PHASE 1: waiting for mstsc to connect (timeout ${TIMEOUT_SECS}s)"
+echo "Please connect mstsc now if you haven't already, and keep it open."
+echo "The test runs the moment krdp logs 'Video stream initialized' AND a"
+echo "TCP connection on :3389 is observed in ESTABLISHED state."
+echo
+
+# Capture a wall-clock timestamp before we start waiting; later journal
+# queries restrict their window using --since to avoid tripping on stale
+# "Video stream initialized" lines from previous mstsc cycles.
+START_EPOCH=$(date +%s)
+
+CONNECTED=0
+for i in $(seq 1 "$TIMEOUT_SECS"); do
+    # Established TCP session on :3389 = an mstsc client is past the
+    # handshake and has a real socket open. RDP retries during NLA may
+    # show up briefly even when auth ultimately fails, but ESTABLISHED
+    # is a stronger signal than just SYN_RECV.
+    if ss -nt 2>/dev/null | grep -E ':3389\b.*ESTAB' >/dev/null; then
+        # Also require a "Video stream initialized" line emitted *after*
+        # we started, which means krdp has handed the screencast stream
+        # to FreeRDP and the virtual output is live.
+        SINCE="@${START_EPOCH}"
+        if journalctl --user -u app-org.kde.krdpserver.service \
+                --since "$SINCE" --no-pager 2>/dev/null \
+                | grep -q "Video stream initialized"; then
+            echo "  mstsc connected at $(date -Iseconds)"
+            # Tiny grace period so KWin actually finishes wiring up the
+            # new virtual output before we query it -- without this the
+            # kde_output_management list can race ahead of the device
+            # registry update.
+            sleep 1
+            CONNECTED=1
+            break
+        fi
+    fi
+    if (( i % 5 == 0 )); then
+        echo "  ...still waiting (${i}s elapsed)"
+    fi
+    sleep 1
+done
+
+if [ "$CONNECTED" -ne 1 ]; then
+    stage "TIMEOUT: no live mstsc connection observed in ${TIMEOUT_SECS}s"
+    echo
+    echo "Most likely causes:"
+    echo "  * mstsc never reached video init (NLA / SAM auth failure?)"
+    echo "  * mstsc connected and disconnected before we noticed"
+    echo
+    echo "Current output list:"
+    /usr/bin/consolerdp-output list || true
+    echo
+    echo "Last 80 lines of krdp journal:"
+    journalctl --user -u app-org.kde.krdpserver.service --since '5 min ago' \
+        --no-pager 2>&1 | tail -80 || true
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 2-9: actual experiment
+# ---------------------------------------------------------------------------
+
+stage "PHASE 2: BEFORE state"
+/usr/bin/consolerdp-output list
+echo
+echo "TCP :3389 sockets:"
+ss -ntp 2>&1 | grep ':3389' || echo "  (none)"
+
+stage "PHASE 3: disable-physical (with primary promotion)"
+/usr/bin/consolerdp-output disable-physical
+
+stage "PHASE 4: DURING state"
+sleep 1
+/usr/bin/consolerdp-output list
+
+stage "PHASE 5: sleeping ${WAIT_SECS}s -- LOOK AT mstsc NOW"
+echo "Local screen should be black."
+echo "Check on mstsc whether you can see:"
+echo "  * your real wallpaper"
+echo "  * panel/taskbar"
+echo "  * open application windows"
+echo
+for i in $(seq "$WAIT_SECS" -1 1); do
+    printf "\r  ... %3d seconds remaining " "$i"
+    sleep 1
+done
+echo
+
+stage "PHASE 6: re-enable physical (with primary restoration)"
+/usr/bin/consolerdp-output enable-physical
+
+stage "PHASE 7: AFTER state"
+sleep 1
+/usr/bin/consolerdp-output list
+
+stage "PHASE 8: krdp journal across the test window"
+journalctl --user -u app-org.kde.krdpserver.service --since '5 min ago' \
+    --no-pager 2>&1 | tail -120 || true
+
+stage "PHASE 9: KWin/Plasma compositor journal across the test window"
+# KWin lives in the user systemd session. Plasma 6 starts it via
+# plasma-kwin_wayland.service when systemd-startup is enabled, otherwise
+# kwin is launched ad-hoc and emits its messages under the session leader.
+# The grep covers both cases plus kscreen/output-management traffic.
+journalctl --user --since '5 min ago' --no-pager 2>&1 \
+    | grep -iE 'kwin|outputconfig|outputmanagement|primary output|kscreen' \
+    | tail -120 || true
+
+# Past the dangerous part now -- drop the trap so the debrief prompts
+# don't trigger a redundant enable-physical.
+trap - EXIT INT TERM
+
+stage "DEBRIEF: 4 quick questions about what mstsc showed"
+echo "(answers are saved to $LOG)"
+echo
+read -r -p "Q1) Did mstsc show your REAL wallpaper?            [y/n/u]: " A1 \
+    || A1="(no answer)"
+read -r -p "Q2) Did mstsc show your panel/taskbar?             [y/n/u]: " A2 \
+    || A2="(no answer)"
+read -r -p "Q3) Did mstsc show your OPEN APP WINDOWS?          [y/n/u]: " A3 \
+    || A3="(no answer)"
+read -r -p "Q4) Free-text notes (anything weird, lag, errors): "       A4 \
+    || A4="(no answer)"
+
+stage "DEBRIEF RESULTS"
+echo "Q1 real wallpaper        : $A1"
+echo "Q2 panel/taskbar         : $A2"
+echo "Q3 open app windows      : $A3"
+echo "Q4 free notes            : $A4"
+
+stage "consolerdp-output-test FINISHED"
+echo "Log: $LOG"

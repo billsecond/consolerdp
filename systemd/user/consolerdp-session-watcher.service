@@ -1,0 +1,28 @@
+[Unit]
+Description=ConsoleRDP session watcher (auto-claim panel+wallpaper for mstsc, auto-corral windows)
+Documentation=https://github.com/billsecond/consolerdp
+# Tie lifecycle to the graphical session so we come up with Plasma and
+# die when the user logs out. PartOf= also means "systemctl stop
+# graphical-session.target" stops us.
+PartOf=graphical-session.target
+After=plasma-workspace.target
+Requires=plasma-workspace.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/consolerdp-session-watcher
+# Poll loop is cheap but do not spin on failure; restart with backoff
+# so a broken consolerdp-output doesn't log-spam.
+Restart=on-failure
+RestartSec=5
+# The watcher needs to reach the user session bus to query Plasma.
+# systemd --user inherits DBUS_SESSION_BUS_ADDRESS from the user
+# manager environment, which on Plasma 6 is set correctly by
+# /usr/lib/systemd/user-generators/. No further tweaks needed.
+Nice=5
+# Cap memory/CPU so a stuck corral watcher can't hose the session.
+MemoryHigh=64M
+CPUQuota=20%
+
+[Install]
+WantedBy=graphical-session.target

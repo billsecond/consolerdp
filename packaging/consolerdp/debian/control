@@ -1,0 +1,41 @@
+Source: consolerdp
+Section: admin
+Priority: optional
+Maintainer: ConsoleRDP <consolerdp@local>
+Build-Depends:
+ debhelper-compat (= 13),
+Standards-Version: 4.6.2
+Homepage: https://github.com/billsecond/consolerdp
+Rules-Requires-Root: no
+
+Package: consolerdp
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3 (>= 3.10),
+ kbd,
+ util-linux,
+ systemd,
+ libkpipewirerecord6 (>= 6.6.4-0ubuntu1+consolerdp1),
+ krdp (>= 6.6.4-0ubuntu1+consolerdp4),
+ plasma-desktop,
+ kwin-wayland,
+ sddm,
+Recommends:
+ ufw,
+ plasma-remotedesktop,
+Description: Windows-style single-seat RDP takeover for Linux (Plasma 6 Wayland)
+ ConsoleRDP orchestrates KDE's krdpserver so that a Linux workstation
+ behaves like a Windows box with Remote Desktop enabled: one desktop,
+ one session, and whoever authenticates last (locally or via mstsc)
+ takes the seat.
+ .
+ The orchestrator (consolerdp-daemon) watches the krdp journal, the
+ systemd-logind session list, and the TCP/3389 socket to drive VT
+ switching, xinput lockout, panel claim-screen, session lock and auto-
+ unlock as an RDP session rises and falls.
+ .
+ This package ships the orchestrator, helper scripts, systemd units
+ and config templates. The matching patched krdp and kpipewire
+ libraries must come from the same release bundle; stock Ubuntu
+ builds of those libraries will NOT work.

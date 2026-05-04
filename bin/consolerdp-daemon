@@ -62,6 +62,12 @@ class Config:
     single_rdp: bool
     lock_on_release: bool
     vnc_passwd_file: str
+    # Port that freerdp-shadow-cli listens on. The watcher polls
+    # /proc/net/tcp{,6} for ESTABLISHED sockets bound to this port
+    # so we can drive takeover/release without parsing shadow-cli
+    # logs. Defaults to the RDP standard 3389.
+    rdp_port: int
+    rdp_watch_interval: float
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -71,6 +77,7 @@ class Config:
         seat = cp["seat"]
         bridge = cp["bridge"]
         policy = cp["policy"]
+        rdp = cp["rdp"] if cp.has_section("rdp") else {}
         return cls(
             user=seat["user"].strip(),
             console_tty=int(seat.get("console_tty", "1")),
@@ -80,6 +87,9 @@ class Config:
             single_rdp=policy.getboolean("single_rdp", True),
             lock_on_release=policy.getboolean("lock_on_release", True),
             vnc_passwd_file=seat.get("vnc_passwd_file", DEFAULT_VNC_PASSWD),
+            rdp_port=int(rdp.get("port", "3389")) if rdp else 3389,
+            rdp_watch_interval=float(rdp.get("watch_interval", "0.5"))
+            if rdp else 0.5,
         )
 
 
@@ -125,18 +135,70 @@ class System:
             return []
 
     def session_show(self, sid: str) -> dict:
+        # We *deliberately* don't use ``--value`` here. With ``--value``
+        # loginctl prints one value per line in *canonical* (alphabetical)
+        # order, which differs from the order of ``-p`` flags on the
+        # command line. Older systemd preserved request order; newer
+        # ones (255+) sort. That mismatch silently swapped Active with
+        # State here on Kubuntu 26.04 + systemd 257, breaking session
+        # discovery for any Wayland or X11 session.
+        #
+        # Default ``key=value`` output is unambiguous and stable across
+        # versions, so parse that instead.
         cp = self.run(
-            ["/usr/bin/loginctl", "show-session", sid, "--value",
+            ["/usr/bin/loginctl", "show-session", sid,
              "-p", "Name", "-p", "Display", "-p", "TTY",
              "-p", "Type", "-p", "State", "-p", "Active"],
             check=False,
         )
-        keys = ["Name", "Display", "TTY", "Type", "State", "Active"]
-        values = cp.stdout.decode().splitlines()
-        return dict(zip(keys, values + [""] * (len(keys) - len(values))))
+        out: dict = {}
+        for line in cp.stdout.decode().splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+        return out
 
     def lock_session(self, sid: str) -> None:
         self.run(["/usr/bin/loginctl", "lock-session", sid], check=False)
+
+    def unlock_session(self, sid: str) -> None:
+        """Tell logind to send an Unlock signal to the session.
+
+        Plasma's KSMServer / KScreenLocker subscribes to logind's
+        Unlock signal and dismisses its lockscreen when it fires,
+        without prompting for a password. Same mechanism Windows
+        uses when an RDP login bypasses the local lockscreen: the
+        remote user already authenticated to the seat, so re-asking
+        for the same password at the lockscreen is just friction.
+
+        Safe to call even when the session is not locked -- logind
+        sends the signal regardless and Plasma is a no-op when its
+        lockscreen is already down.
+        """
+        self.run(["/usr/bin/loginctl", "unlock-session", sid], check=False)
+
+    def restart_user_unit(self, user: str, unit: str) -> None:
+        """Restart a systemd --user unit on behalf of *user* from root.
+
+        Used to forcibly drop active krdp connections on local-reclaim:
+        when the seat user signs in at the console, any in-flight RDP
+        session is terminated by bouncing the user's krdpserver unit.
+        Mirrors Windows: a console logon evicts the RDP user.
+
+        We use ``systemctl --user --machine=user@.host`` so we don't
+        need to construct XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS
+        manually — systemd-machined handles the bus path itself.
+        """
+        cp = self.run(
+            ["/usr/bin/systemctl", f"--machine={user}@.host",
+             "--user", "restart", unit],
+            check=False,
+        )
+        if cp.returncode != 0:
+            LOG.warning("restart user unit %s for %s failed (rc=%s): %s",
+                        unit, user, cp.returncode,
+                        cp.stderr.decode(errors="replace").strip())
 
     def xinput_set_all(self, *, enable: bool, display: str,
                        xauth: str, run_as_uid: int) -> None:
@@ -191,40 +253,53 @@ class Orchestrator:
     # -- helpers -----------------------------------------------------------
 
     def _resolve_seat_session(self) -> Optional[dict]:
-        """Find the active local Xorg session owned by the seat user.
+        """Find the local graphical session owned by the seat user.
 
-        Wayland sessions are deliberately rejected here: x11vnc cannot
-        attach to a Wayland compositor's framebuffer, so a "successful"
-        takeover would leave the user staring at an Xwayland blank
-        canvas while the local screen is VT-switched away. Far better
-        to fail loudly with a clear remediation message.
+        Both X11 and Wayland sessions are accepted: the capture
+        backend (freerdp-shadow-cli for X11, krdpserver for Wayland)
+        runs as the seat user inside their own login session, so we
+        no longer need to attach to ``:0`` from outside.
+
+        Critical detail: we filter by ``State in {active,online}`` *not*
+        by ``Active==yes``. After a takeover, ``chvt`` to the greeter
+        TTY moves the session out of the foreground and logind flips
+        ``Active`` to ``no`` — but ``State`` stays ``active`` (or
+        ``online``) until the user actually logs out. Filtering on
+        ``Active`` would mean every reconnect after the first one is
+        refused with "no active local session", which is exactly the
+        bug we hit on Wayland during testing.
+
+        States we *exclude*:
+
+        * ``closing``: user is logging out, the session is going away
+        * ``opening``: SDDM is still bringing it up; not yet usable
+
+        Returned dict carries ``Type`` so callers can branch (xinput
+        is X11-only, etc.).
         """
         try:
             uid = pwd.getpwnam(self.cfg.user).pw_uid
         except KeyError:
             LOG.error("configured seat user %r does not exist", self.cfg.user)
             return None
-        wayland_seen = False
+        live_states = {"active", "online"}
+        # Prefer x11 if both are present (rare, but a stale X session
+        # can linger when SDDM autostarts a fallback).
+        first_wayland: Optional[dict] = None
         for s in self.sys.list_sessions():
             if int(s.get("uid", -1)) != uid:
                 continue
             details = self.sys.session_show(s["session"])
-            active = details.get("Active") in {"yes", "true"}
-            stype = details.get("Type")
-            if not active:
+            if details.get("State") not in live_states:
                 continue
+            stype = details.get("Type")
+            details["Id"] = s["session"]
+            details["Uid"] = uid
             if stype == "x11":
-                details["Id"] = s["session"]
-                details["Uid"] = uid
                 return details
-            if stype == "wayland":
-                wayland_seen = True
-        if wayland_seen:
-            LOG.error(
-                "seat user %r has an active Wayland session, not Xorg. "
-                "ConsoleRDP requires Plasma (X11). Log out and pick "
-                "'Plasma (X11)' at SDDM, then retry.", self.cfg.user)
-        return None
+            if stype == "wayland" and first_wayland is None:
+                first_wayland = details
+        return first_wayland
 
     def _xauth_for(self, uid: int) -> str:
         """Best-effort discovery of the seat user's Xauthority file."""
@@ -261,46 +336,70 @@ class Orchestrator:
 
             sess = self._resolve_seat_session()
             if sess is None:
-                # _resolve_seat_session has already logged a precise
-                # reason (no session at all vs Wayland). Pass a short
-                # actionable hint back over the wire.
-                if any(
-                    int(s.get("uid", -1))
-                    == pwd.getpwnam(self.cfg.user).pw_uid
-                    for s in self.sys.list_sessions()
-                ):
-                    return ("ERR seat user has a Wayland session — "
-                            "log out and pick 'Plasma (X11)' at SDDM")
-                return "ERR no active local X session for seat user"
+                return ("ERR no active local session for seat user "
+                        "(neither x11 nor wayland)")
+            stype = sess.get("Type", "x11")
             display = sess.get("Display") or ":0"
-            try:
-                xauth = self._xauth_for(sess["Uid"])
-            except FileNotFoundError as e:
-                return f"ERR {e}"
+            xauth: Optional[str] = None
 
             try:
-                self.sys.xinput_set_all(
-                    enable=False, display=display, xauth=xauth,
-                    run_as_uid=sess["Uid"],
-                )
+                # On X11 we additionally disable physical input devices
+                # as defence in depth: even though VT-switching parks
+                # the local screen on the greeter, a passer-by could
+                # otherwise still type into the X server via the same
+                # keyboard if they hit Ctrl+Alt+Fn back to the X VT.
+                # On Wayland xinput is irrelevant — KWin/Mutter own
+                # input — so we skip it.
+                if stype == "x11":
+                    try:
+                        xauth = self._xauth_for(sess["Uid"])
+                    except FileNotFoundError as e:
+                        LOG.warning("xauth not found, skipping xinput "
+                                    "lockdown: %s", e)
+                    if xauth is not None:
+                        self.sys.xinput_set_all(
+                            enable=False, display=display, xauth=xauth,
+                            run_as_uid=sess["Uid"],
+                        )
                 self.sys.chvt(self.cfg.greeter_tty)
             except Exception as e:  # noqa: BLE001
                 LOG.exception("takeover failed: %s", e)
                 # Best-effort rollback.
-                self.sys.xinput_set_all(
-                    enable=True, display=display, xauth=xauth,
-                    run_as_uid=sess["Uid"],
-                )
-                self.sys.chvt(self.cfg.console_tty)
+                if stype == "x11" and xauth is not None:
+                    try:
+                        self.sys.xinput_set_all(
+                            enable=True, display=display, xauth=xauth,
+                            run_as_uid=sess["Uid"],
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self.sys.chvt(self.cfg.console_tty)
+                except Exception:  # noqa: BLE001
+                    pass
                 return f"ERR takeover failed: {e}"
 
             self.state.rdp_active = True
             self.state.rdp_user = user
             self.state.rdp_session_id = sess["Id"]
             self.state.saved_console_tty = self.cfg.console_tty
-            LOG.info("takeover complete for user=%s display=%s tty->%d "
-                     "(x11vnc will be started by Xvnc shim)",
-                     user, display, self.cfg.greeter_tty)
+            # Auto-unlock the seat user's Plasma session. The release
+            # path locks it for physical-access defense, but a
+            # subsequent mstsc reconnect has just authenticated the
+            # SAME user via NLA (PAM-validated), so re-prompting at
+            # Plasma's lockscreen would be redundant friction. logind
+            # broadcasts an Unlock signal which Plasma honours
+            # without password. Mirrors Windows RDP: a remote login
+            # bypasses the local lockscreen for the same user.
+            try:
+                self.sys.unlock_session(sess["Id"])
+            except Exception as e:  # noqa: BLE001
+                # Non-fatal: lockscreen will just stay up and the
+                # user can dismiss it manually inside mstsc.
+                LOG.warning("unlock-session failed: %s", e)
+            LOG.info("takeover complete for user=%s session_type=%s "
+                     "display=%s tty->%d (auto-unlocked)",
+                     user, stype, display, self.cfg.greeter_tty)
             return "OK"
 
     def release(self, user: str) -> str:
@@ -314,16 +413,95 @@ class Orchestrator:
             return "OK"
 
     def reclaim(self, user: str) -> str:
-        # Local console reclaim: same primitive as release, but the local
-        # user has just authenticated at the greeter.
+        """Local console reclaim — fired when the seat user signs back in
+        at the local console (lockscreen unlock OR greeter login OR
+        manual VT switch back to ``console_tty``).
+
+        Mirrors Windows console-takes-over semantics: the in-flight RDP
+        session is forcibly disconnected so the same desktop isn't
+        being driven from two places. We achieve that by bouncing the
+        seat user's ``app-org.kde.krdpserver.service`` user unit; any
+        attached client receives a clean TCP close and mstsc shows
+        "The connection has been ended".
+
+        Order matters:
+
+        1. Bounce krdp (drops mstsc).
+        2. Re-enable physical input on X11 (no-op on Wayland).
+        3. Clear our state.
+        4. ``chvt`` back to ``console_tty`` so the user lands on their
+           live session (which Plasma will have auto-locked while the
+           VT was backgrounded; the lockscreen prompts for the same
+           password they just typed at the greeter).
+        """
         if user != self.cfg.user:
             return f"ERR user {user!r} is not the configured seat owner"
-        return self.release(user)
+        with self.state.lock:
+            if self.state.rdp_active:
+                # Kick krdp BEFORE _tear_down_locked: that helper runs
+                # loginctl lock-session, and we want the disconnect to
+                # land first so mstsc doesn't briefly show the
+                # lockscreen mid-tear-down.
+                self._kick_krdp_locked()
+                self._tear_down_locked()
+            try:
+                self.sys.chvt(self.cfg.console_tty)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("reclaim chvt failed: %s", e)
+                return f"ERR chvt: {e}"
+        LOG.info("reclaim: local user %r returned to console tty %d",
+                 user, self.cfg.console_tty)
+        return "OK"
+
+    def _kick_krdp_locked(self) -> None:
+        """Forcibly drop active RDP sessions by restarting the krdpserver
+        user unit. Caller must hold self.state.lock.
+
+        krdpserver doesn't expose a "disconnect-current-client" API —
+        the simplest reliable boot is to restart the unit. systemd then
+        re-spawns it within ``RestartSec``, ready for the next mstsc.
+        """
+        try:
+            self.sys.restart_user_unit(
+                self.cfg.user, "app-org.kde.krdpserver.service")
+            LOG.info("_kick_krdp: restarted app-org.kde.krdpserver.service "
+                     "for %r", self.cfg.user)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("_kick_krdp failed: %s", e)
 
     def _tear_down_locked(self) -> None:
-        """Caller must hold self.state.lock."""
+        """Caller must hold self.state.lock.
+
+        On release we re-enable xinput (X11 only), lock the session,
+        then chvt BACK to console_tty so KWin/Plasma holds the
+        foreground VT again. This is critical for the remote-reconnect
+        path: when mstsc disconnects we used to stay parked on the
+        greeter tty for "defence in depth", but that left KWin
+        (running on console_tty) without the active VT -- which means
+        it does not hold DRM master. Any subsequent mstsc connect
+        asks krdpserver for a new screencast, krdpserver asks KWin,
+        and KWin's atomic modeset dies with "Permission denied"
+        because it is not the foreground VT. Net result: the user
+        cannot reconnect remotely at all until somebody at the
+        physical console manually Ctrl+Alt+F<console_tty>es (or
+        logs in at the greeter, which does the same chvt via the
+        reclaim path).
+
+        Staying on the greeter was only ever slightly more secure
+        than falling back to the Plasma lockscreen -- both demand the
+        same PAM auth -- and the reconnect-break cost is far higher
+        than that marginal physical-access benefit. So:
+
+          1. lock the session  -> Plasma lockscreen arms itself.
+          2. chvt to console_tty -> VT flips to the Plasma vc.
+          3. KWin regains DRM master -> next mstsc connect works.
+
+        VtMonitor's reclaim trigger is gated on rdp_active, and we
+        clear that BEFORE the chvt, so the VT transition we are
+        about to cause does not fire a spurious reclaim().
+        """
         sess = self._resolve_seat_session()
-        if sess is not None:
+        if sess is not None and sess.get("Type") == "x11":
             try:
                 xauth = self._xauth_for(sess["Uid"])
                 self.sys.xinput_set_all(
@@ -332,14 +510,33 @@ class Orchestrator:
                 )
             except Exception as e:  # noqa: BLE001
                 LOG.warning("could not re-enable xinput: %s", e)
-            if self.cfg.lock_on_release and self.state.rdp_session_id:
+        if self.cfg.lock_on_release and self.state.rdp_session_id:
+            try:
                 self.sys.lock_session(self.state.rdp_session_id)
-        self.sys.chvt(self.state.saved_console_tty or self.cfg.console_tty)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("loginctl lock-session failed: %s", e)
+        # Clear state BEFORE the chvt so VtMonitor's
+        # "greeter -> console during takeover" edge does not fire
+        # reclaim on the transition we are about to cause.
         self.state.rdp_active = False
         self.state.rdp_user = None
         self.state.rdp_session_id = None
+        saved_console_tty = self.state.saved_console_tty or self.cfg.console_tty
         self.state.saved_console_tty = None
-        LOG.info("released seat back to console")
+        try:
+            self.sys.chvt(saved_console_tty)
+            LOG.info("released seat: locked session, chvt -> tty%d",
+                     saved_console_tty)
+        except Exception as e:  # noqa: BLE001
+            # Non-fatal: we already locked the session and cleared
+            # takeover state. Remote reconnect will still be broken
+            # until somebody manually VT-switches, but the rest of
+            # the release semantics (locked + xinput re-enabled) is
+            # intact.
+            LOG.warning(
+                "released seat: locked session BUT chvt tty%d failed: %s "
+                "(remote reconnect may be broken until VT switched)",
+                saved_console_tty, e)
 
     def status(self) -> str:
         with self.state.lock:
@@ -410,6 +607,301 @@ class _Server(socketserver.ThreadingUnixStreamServer):
     allow_reuse_address = True
 
 
+# --------------------------------------------------------------------------- #
+# RDP connection watcher
+# --------------------------------------------------------------------------- #
+
+
+class RdpWatcher(threading.Thread):
+    """Polls the kernel for ESTABLISHED TCP connections to the RDP port
+    to detect *disconnects* only.
+
+    Connect-side detection is delegated to :class:`KrdpJournalTailer`,
+    which fires takeover only after krdp logs auth success. This split
+    is deliberate — with NLA, the TCP connection is established the
+    moment mstsc clicks Connect, but the user is still typing into
+    mstsc's credential dialog. Triggering takeover on TCP would flip
+    the local screen to the greeter before the password is even
+    entered (the very behaviour the user reported as broken).
+
+    Disconnect detection stays here because:
+
+    * The kernel's tcp state is the canonical "is anyone connected"
+      signal — unaffected by krdp log buffering.
+    * krdp's "Closing session" log line lags actual TCP close by up
+      to a second on disconnect, and we want release to be snappy.
+    * If krdp is killed entirely (e.g. the user runs ``systemctl
+      --user stop``), we still want to release the seat.
+
+    Implementation notes:
+
+    * Reads ``/proc/net/tcp`` and ``/proc/net/tcp6`` directly. No
+      dependency on ``ss`` or ``netstat``.
+    * Only counts state ``01`` (TCP_ESTABLISHED). Listening sockets
+      (``0A``) and TIME_WAIT (``06``) are excluded.
+    * Filters by *local* port == cfg.rdp_port.
+    * Acts only when ``orch.state.rdp_active`` is already True; never
+      initiates takeover.
+    """
+
+    TCP_ESTABLISHED = "01"
+
+    # How many consecutive polls must show "no ESTABLISHED connection"
+    # before we fire RELEASE. mstsc with NLA briefly tears down its
+    # initial auth TCP and opens a fresh one for the RDP stream; the
+    # gap can be >500ms on a slow box, which used to trip a spurious
+    # release right after the corresponding takeover. Require a full
+    # 1.5s of sustained absence before calling it a disconnect.
+    DISCONNECT_DEBOUNCE = 3
+
+    def __init__(self, orch: "Orchestrator", stop: threading.Event) -> None:
+        super().__init__(name="RdpWatcher", daemon=True)
+        self.orch = orch
+        self.stop = stop
+        self.cfg = orch.cfg
+        self._empty_polls = 0
+
+    @staticmethod
+    def _scan(path: str, want_port_hex: str) -> int:
+        try:
+            with open(path, "r", encoding="ascii") as f:
+                lines = f.readlines()[1:]
+        except FileNotFoundError:
+            return 0
+        n = 0
+        for line in lines:
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            local_addr = cols[1]
+            state = cols[3]
+            if state != RdpWatcher.TCP_ESTABLISHED:
+                continue
+            if ":" in local_addr and local_addr.split(":")[1] == want_port_hex:
+                n += 1
+        return n
+
+    def _established_count(self) -> int:
+        port_hex = f"{self.cfg.rdp_port:04X}"
+        return (self._scan("/proc/net/tcp", port_hex)
+                + self._scan("/proc/net/tcp6", port_hex))
+
+    def run(self) -> None:
+        LOG.info("rdp-watcher started: polling tcp/%d every %.1fs "
+                 "(disconnect-detection only; debounce=%d polls)",
+                 self.cfg.rdp_port, self.cfg.rdp_watch_interval,
+                 self.DISCONNECT_DEBOUNCE)
+        self.stop.wait(self.cfg.rdp_watch_interval)
+        while not self.stop.is_set():
+            try:
+                live = self._established_count() > 0
+                if live:
+                    # Reset the debounce counter whenever we see
+                    # at least one connection. This handles the NLA
+                    # case where mstsc bounces from auth TCP to
+                    # stream TCP: during the bounce we may poll
+                    # during the gap and see zero, but the very next
+                    # poll sees the new stream TCP, and we should
+                    # *not* interpret that one-poll gap as a
+                    # disconnect.
+                    if self._empty_polls:
+                        LOG.debug(
+                            "rdp-watcher: connection re-observed after "
+                            "%d empty poll(s), not firing release",
+                            self._empty_polls)
+                    self._empty_polls = 0
+                elif self.orch.state.rdp_active:
+                    self._empty_polls += 1
+                    if self._empty_polls >= self.DISCONNECT_DEBOUNCE:
+                        LOG.info(
+                            "rdp-watcher: client disconnected "
+                            "(%d consecutive empty polls) → RELEASE",
+                            self._empty_polls)
+                        self._empty_polls = 0
+                        reply = self.orch.release(self.cfg.user)
+                        if not reply.startswith("OK"):
+                            LOG.warning("release refused by orchestrator: %s",
+                                        reply)
+                else:
+                    self._empty_polls = 0
+            except Exception as e:  # noqa: BLE001
+                LOG.exception("rdp-watcher loop error: %s", e)
+            self.stop.wait(self.cfg.rdp_watch_interval)
+        LOG.info("rdp-watcher stopped")
+
+
+# --------------------------------------------------------------------------- #
+# krdp journal tailer — the *correct* takeover trigger
+# --------------------------------------------------------------------------- #
+
+
+class KrdpJournalTailer(threading.Thread):
+    """Tails the seat user's ``app-org.kde.krdpserver.service`` journal
+    and fires :meth:`Orchestrator.takeover` when krdp logs that NLA +
+    PAM auth has completed for a *new* client connection.
+
+    The marker is the literal log line emitted by krdp's
+    ``RdpConnection`` after ``pam_authenticate`` returns success:
+
+        ``org.kde.krdp: PAM authentication succeeded for user "<name>"``
+
+    Earlier iterations used ``Session setup completed, start
+    processing…`` but that string is logged at krdp *process* startup
+    when the long-lived screen-cast portal session is created. Since
+    KRdp reuses that one portal session across every client, the line
+    fires once at boot and never again — making it useless as a
+    per-connection trigger. ``PAM authentication succeeded`` is
+    emitted exactly once per successful client auth, which is what we
+    want.
+
+    Why a journal tail and not a DBus signal?  KRdp 6.6 does not
+    publish per-connection state on DBus, and we want to avoid
+    forking the daemon into a Qt application just to subscribe to
+    in-process Qt signals. journalctl is part of every systemd
+    install, has stable line semantics (one record per line with
+    ``-o cat``), and follows the unit even across krdp restarts.
+
+    The subprocess is restarted automatically if journalctl exits
+    (e.g. systemd-journald rotated the log under us).
+    """
+
+    SUCCESS_MARKER = "PAM authentication succeeded for user"
+    UNIT = "app-org.kde.krdpserver.service"
+
+    def __init__(self, orch: "Orchestrator", stop: threading.Event,
+                 uid: int) -> None:
+        super().__init__(name="KrdpJournalTailer", daemon=True)
+        self.orch = orch
+        self.stop = stop
+        self.uid = uid
+
+    def _spawn(self) -> subprocess.Popen:
+        # Filter strictly by the user-systemd unit AND the seat user's
+        # UID. _SYSTEMD_USER_UNIT alone is ambiguous if multiple users
+        # are logged in (e.g. SDDM + the seat user) — _UID disambiguates.
+        argv = [
+            "/usr/bin/journalctl",
+            f"_SYSTEMD_USER_UNIT={self.UNIT}",
+            f"_UID={self.uid}",
+            "-f", "-o", "cat", "-n", "0",
+        ]
+        LOG.info("krdp-journal: spawn %s", " ".join(shlex.quote(a)
+                                                     for a in argv))
+        return subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1,  # line-buffered
+        )
+
+    def run(self) -> None:
+        while not self.stop.is_set():
+            try:
+                proc = self._spawn()
+            except FileNotFoundError:
+                LOG.error("journalctl not found; takeover gating disabled")
+                return
+            try:
+                while not self.stop.is_set():
+                    line = proc.stdout.readline()
+                    if not line:
+                        # journalctl exited — break out, outer loop
+                        # will respawn after a short delay.
+                        break
+                    if self.SUCCESS_MARKER in line:
+                        if self.orch.state.rdp_active:
+                            # Already in takeover (e.g. mstsc reconnect
+                            # while we were still in the previous session
+                            # tear-down). Nothing to do.
+                            continue
+                        LOG.info("krdp-journal: auth complete → TAKEOVER")
+                        reply = self.orch.takeover(self.orch.cfg.user)
+                        if not reply.startswith("OK"):
+                            LOG.warning(
+                                "takeover refused by orchestrator: %s", reply)
+            finally:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:  # noqa: BLE001
+                    proc.kill()
+            if not self.stop.is_set():
+                LOG.warning("krdp-journal: tail exited, respawning in 1s")
+                self.stop.wait(1.0)
+        LOG.info("krdp-journal-tailer stopped")
+
+
+# --------------------------------------------------------------------------- #
+# VT monitor — detects local-console reclaim by watching active TTY
+# --------------------------------------------------------------------------- #
+
+
+class VtMonitor(threading.Thread):
+    """Watches ``/sys/class/tty/tty0/active`` for the user returning to
+    the console TTY *while we're in takeover*.
+
+    The kernel exposes the currently-foreground VT as a string like
+    ``tty2`` in that file. After ``chvt`` to the greeter the value is
+    ``tty<greeter_tty>``; when the human at the keyboard hits
+    Ctrl+Alt+F<console_tty> (or unlocks the Plasma lockscreen which
+    chvts back via logind) the value flips to ``tty<console_tty>``.
+
+    On that transition we fire :meth:`Orchestrator.reclaim`, which
+    bounces krdp and disconnects mstsc — mirroring the Windows
+    "console logon ejects RDP" semantics. Without this monitor, the
+    same desktop is driven from two heads at once and the user sees
+    the local cursor and the remote cursor fighting (the "mirror"
+    bug reported as #3).
+    """
+
+    ACTIVE_PATH = "/sys/class/tty/tty0/active"
+    POLL_INTERVAL = 0.25
+
+    def __init__(self, orch: "Orchestrator", stop: threading.Event) -> None:
+        super().__init__(name="VtMonitor", daemon=True)
+        self.orch = orch
+        self.stop = stop
+        self.cfg = orch.cfg
+        self._last: Optional[int] = None
+
+    def _read_active(self) -> Optional[int]:
+        try:
+            with open(self.ACTIVE_PATH, "r", encoding="ascii") as f:
+                txt = f.read().strip()
+        except FileNotFoundError:
+            return None
+        if not txt.startswith("tty"):
+            return None
+        try:
+            return int(txt[3:])
+        except ValueError:
+            return None
+
+    def run(self) -> None:
+        LOG.info("vt-monitor started: console=tty%d greeter=tty%d "
+                 "poll=%.2fs",
+                 self.cfg.console_tty, self.cfg.greeter_tty,
+                 self.POLL_INTERVAL)
+        while not self.stop.is_set():
+            now = self._read_active()
+            if now is not None:
+                if (self._last is not None and now != self._last
+                        and self.orch.state.rdp_active
+                        and self._last == self.cfg.greeter_tty
+                        and now == self.cfg.console_tty):
+                    LOG.info("vt-monitor: VT %d → %d during takeover → "
+                             "RECLAIM (drop RDP)",
+                             self._last, now)
+                    # Run reclaim off-thread so a slow loginctl
+                    # call doesn't delay our next poll.
+                    threading.Thread(
+                        target=self.orch.reclaim,
+                        args=(self.cfg.user,),
+                        daemon=True, name="vt-reclaim",
+                    ).start()
+                self._last = now
+            self.stop.wait(self.POLL_INTERVAL)
+        LOG.info("vt-monitor stopped")
+
+
 def _make_socket(path: str) -> _Server:
     if os.path.exists(path):
         os.unlink(path)
@@ -459,6 +951,29 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     stop = threading.Event()
 
+    # Three coordinated background threads:
+    #
+    # * KrdpJournalTailer drives takeover. It only fires AFTER krdp
+    #   logs that auth completed — so the local console doesn't flip
+    #   to the greeter while the user is still typing into mstsc's
+    #   credential dialog (issue #1).
+    # * RdpWatcher drives release. It polls TCP and triggers when the
+    #   established-count drops to zero while we're in takeover.
+    # * VtMonitor drives local reclaim. It watches the active VT and
+    #   bounces krdp when the user comes back to the console TTY,
+    #   evicting the remote client (issue #3).
+    try:
+        seat_uid = pwd.getpwnam(cfg.user).pw_uid
+    except KeyError:
+        LOG.error("seat user %r not found in passwd; aborting", cfg.user)
+        return 2
+    journal_tailer = KrdpJournalTailer(orch, stop, seat_uid)
+    journal_tailer.start()
+    watcher = RdpWatcher(orch, stop)
+    watcher.start()
+    vt_monitor = VtMonitor(orch, stop)
+    vt_monitor.start()
+
     def _term(signum: int, _frame) -> None:  # noqa: ANN001
         LOG.info("signal %s received, shutting down", signum)
         stop.set()
@@ -467,11 +982,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGINT, _term)
     signal.signal(signal.SIGTERM, _term)
 
-    LOG.info("consolerdp-daemon listening on %s for seat user=%s",
-             args.socket, cfg.user)
+    LOG.info("consolerdp-daemon listening on %s for seat user=%s "
+             "(rdp watcher tcp/%d)",
+             args.socket, cfg.user, cfg.rdp_port)
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        stop.set()
+        for t in (journal_tailer, watcher, vt_monitor):
+            t.join(timeout=2)
         try:
             os.unlink(args.socket)
         except OSError:

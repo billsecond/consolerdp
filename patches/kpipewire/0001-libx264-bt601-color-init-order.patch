@@ -1,0 +1,104 @@
+From: ConsoleRDP <consolerdp@local>
+Date: Mon, 4 May 2026 08:20:00 -0500
+Subject: Fix libx264 encoder color pipeline for mstsc compatibility
+
+Three related fixes bundled together because they all live in the
+same function and one depends on the other:
+
+1. Initialization-order bug in LibX264Encoder ctor
+--------------------------------------------------
+The ctor built m_filterGraphToParse from m_colorRange, but at ctor
+time m_colorRange is still the Encoder base-class default (Limited).
+PipeWireProduce::setupEncoder() calls encoder->setColorRange(...)
+*after* the encoder is constructed and *before* encoder->initialize()
+runs -- but the filter string was already baked. Result: setting
+ColorRange::Full on the stream silently did nothing; the filter kept
+squeezing YUV into 16-235 while the H.264 VUI advertised Full range.
+mstsc saw "Full" in the VUI, passed the Y values through verbatim,
+and rendered 16-235 as if it were 0-255 -> lifted blacks (pure black
+displays as ~#262626 on mstsc).
+
+Fix: move the filter-graph string construction from the ctor to
+initialize(), which runs AFTER setColorRange(). The ctor is now a
+no-op for color setup.
+
+2. Force BT.601 color matrix in the scale filter
+------------------------------------------------
+mstsc / the RDP-EGFX reference decoder uses BT.601 YUV->RGB math
+regardless of what the H.264 VUI says. The stock libswscale default
+for >= 720p is BT.709, which produces a mismatched inverse on the
+mstsc side (subtly off reds/greens). Force the output matrix to
+BT.601 so encoder and decoder agree.
+
+3. Write explicit BT.601 VUI metadata
+-------------------------------------
+Without setting color_primaries / color_trc / colorspace on the
+AVCodecContext, libx264 writes color_description_present_flag=0
+and decoders guess. Be explicit: all three set to SMPTE170M
+(BT.601 525-line, which is what RDP-EGFX is specified against).
+color_range is tied to m_colorRange so the VUI and the filter
+agree bit-for-bit.
+
+Also adds two one-shot qCWarning log markers
+(CONSOLERDP-LIBX264-FILTER-GRAPH and CONSOLERDP-BT601-VUI-PATCH-ACTIVE)
+so a live session can confirm at runtime that the patched path fired.
+
+Tested with mstsc 10.0.x on Windows 11 -> KRdp via Hyper-V VMConnect
+capture vs mstsc capture. Before: #000 on host shown as ~#262426 in
+mstsc. After: #000 on host shown as #000 in mstsc.
+
+---
+ src/libx264encoder.cpp | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+--- a/src/libx264encoder.cpp
++++ b/src/libx264encoder.cpp
+@@ -32,16 +32,21 @@ LibX264Encoder::LibX264Encoder(H264Profile profile, PipeWireProduce *produce)
+     : SoftwareEncoder(produce)
+     , m_profile(profile)
+ {
+-    auto colorRange = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? u"full"_s : u"limited"_s;
+-
+-    // Adjust the filter graph to ensure we are using an even frame size using a
+-    // pad filter. Otherwise the size adjustment below will insert a row/column
+-    // of garbage instead of black.
+-    m_filterGraphToParse = u"format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_range=%1"_s.arg(colorRange);
++    // Note: do NOT build m_filterGraphToParse here. At this point
++    // m_colorRange is still the Encoder base-class default (Limited)
++    // because PipeWireProduce::setupEncoder() calls setColorRange()
++    // AFTER the encoder is constructed. Building the filter string
++    // here would bake "out_range=limited" into the graph and silently
++    // ignore a later Full setting -- producing Limited YUV with a Full
++    // VUI tag, which mstsc then renders verbatim (lifted blacks).
++    // Build the filter string in initialize() instead.
+ }
+ 
+ bool LibX264Encoder::initialize(const QSize &size)
+ {
++    auto colorRange = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? u"full"_s : u"limited"_s;
++    m_filterGraphToParse = u"format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2,scale=out_color_matrix=bt601:out_range=%1"_s.arg(colorRange);
++    qCWarning(PIPEWIRERECORD_LOGGING) << "CONSOLERDP-LIBX264-FILTER-GRAPH" << m_filterGraphToParse;
+     createFilterGraph(size);
+ 
+     auto codec = avcodec_find_encoder_by_name("libx264");
+@@ -80,6 +85,20 @@ bool LibX264Encoder::initialize(const QSize &size)
+         break;
+     }
+ 
++    // Tag the H.264 stream with explicit VUI color metadata so mstsc
++    // (and any other player) decodes YUV->RGB with the correct matrix
++    // and range, instead of guessing. Without these four fields set,
++    // libx264 writes color_description_present_flag=0 and mstsc defaults
++    // to BT.601 -- causing the washed-out / wrong-color look on a modern
++    // HD desktop, which is sRGB / BT.709 gamma-encoded. Set BT.601 for
++    // RDP-EGFX and obey the user's requested YUV range.
++    m_avCodecContext->color_range     = (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full)
++                                           ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++    m_avCodecContext->color_primaries = AVCOL_PRI_SMPTE170M;
++    m_avCodecContext->color_trc       = AVCOL_TRC_SMPTE170M;
++    m_avCodecContext->colorspace      = AVCOL_SPC_SMPTE170M;
++    qCWarning(PIPEWIRERECORD_LOGGING) << "CONSOLERDP-BT601-VUI-PATCH-ACTIVE";
++
+     AVDictionary *options = buildEncodingOptions();
+     maybeLogOptions(options);
+ 

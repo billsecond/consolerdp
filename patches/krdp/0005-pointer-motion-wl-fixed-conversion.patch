@@ -1,0 +1,80 @@
+Description: Convert pointer_motion_absolute coordinates to wl_fixed_t.
+ .
+ The generated Qt wayland binding for the ``fake-input`` protocol
+ declares ``pointer_motion_absolute(wl_fixed_t x, wl_fixed_t y)``.
+ ``wl_fixed_t`` is the 24.8 signed fixed-point integer format used on
+ the wire by every libwayland client/server, and the canonical way to
+ produce one from a floating-point logical coordinate is the libwayland
+ helper ``wl_fixed_from_double()``.
+ .
+ ``PlasmaScreencastV1Session::sendEvent`` passes the raw double-typed
+ coordinates from ``QPointF::x()`` / ``QPointF::y()`` directly into
+ that call:
+ .
+     d->remoteInterface->pointer_motion_absolute(
+         logicalPosition.x(), logicalPosition.y());
+ .
+ Because the function signature takes ``wl_fixed_t`` (a typedef for
+ ``int32_t``), C++ performs an implicit ``double → int32_t``
+ *truncating* conversion rather than a fixed-point multiplication.
+ The logical value ``512.0`` is sent as the integer ``512`` on the
+ wire, which a wayland peer decodes as a ``wl_fixed_t`` whose
+ floating-point interpretation is ``512 / 256 = 2.0``. In other
+ words, every pointer coordinate is transmitted at 1/256 of its
+ intended magnitude -- a 1024x768 virtual monitor ends up reporting
+ pointer positions in the 0..4 px range at the top-left corner.
+ .
+ The cursor on the KWin side follows those tiny values, so it
+ appears pinned near (0,0). Two user-visible consequences result:
+ .
+   * Moving the mouse on mstsc makes the remote cursor "disappear"
+     into the upper-left -- exactly where Plasma's default Overview
+     hot-corner lives -- so Overview (the "Present Windows" effect)
+     triggers almost continuously. That's the spectacular symptom
+     a tester sees first.
+   * Clicks and keypresses meant for whatever surface is under the
+     mstsc cursor actually target whichever surface is at (0,0) --
+     typically nothing, or a screen edge -- so they are silently
+     dropped. Overview's own search field, which is a KWin-internal
+     effect surface rather than a regular wl_surface, is one of the
+     few places keyboard input still does something, because KWin
+     dispatches keys into the effect directly without routing through
+     the unicode-owning surface. That is why users report "typing
+     works in the window switcher's search box but not in regular
+     applications".
+ .
+ The sibling ``axis()`` call two lines down already uses
+ ``wl_fixed_from_double()`` correctly:
+ .
+     d->remoteInterface->axis(
+         WL_POINTER_AXIS_VERTICAL_SCROLL,
+         wl_fixed_from_double(delta.y()));
+ .
+ so this patch applies the same conversion to the
+ ``pointer_motion_absolute`` arguments for consistency and correct
+ wire-format semantics.
+ .
+ ``keyboard_key()`` is unaffected: it takes ``uint32_t`` scancode /
+ state, which are plain integers, not fixed-point.
+ ``PortalSession::sendEvent`` uses ``NotifyPointerMotionAbsolute``
+ over DBus, which accepts IEEE-754 doubles directly, so the same
+ arithmetic is already correct for the portal code path.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-04-30
+Bug-KDE: not-yet (intent to file at https://bugs.kde.org/ once tested)
+
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -233,7 +233,9 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+     case QEvent::MouseMove: {
+         auto me = std::static_pointer_cast<QMouseEvent>(event);
+         auto position = me->position();
+         auto logicalPosition = QPointF{(position.x() / size().width()) * logicalSize().width(), (position.y() / size().height()) * logicalSize().height()};
+-        d->remoteInterface->pointer_motion_absolute(logicalPosition.x(), logicalPosition.y());
++        d->remoteInterface->pointer_motion_absolute(
++            wl_fixed_from_double(logicalPosition.x()),
++            wl_fixed_from_double(logicalPosition.y()));
+         break;
+     }
+     case QEvent::Wheel: {

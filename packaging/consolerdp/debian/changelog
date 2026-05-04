@@ -1,0 +1,13 @@
+consolerdp (1.0.0) resolute; urgency=medium
+
+  * Initial public release.
+  * Orchestrator daemon (consolerdp-daemon) with rdp-watcher disconnect
+    debouncing and session auto-unlock on takeover.
+  * Helper scripts: claim-screen, corral-windows, isolate-krdp-output,
+    output, make-rdp, doctor, takeover/release/ctl, session-watcher.
+  * systemd units: consolerdp.service, consolerdp-greeter@.service,
+    user-level consolerdp-session-watcher.service.
+  * Works with patched krdp and kpipewire (shipped as companion .debs).
+  * Target: Kubuntu 26.04 LTS amd64, Plasma 6.6 Wayland.
+
+ -- ConsoleRDP <consolerdp@local>  Mon, 04 May 2026 09:50:00 -0500

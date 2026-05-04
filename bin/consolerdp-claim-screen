@@ -1,0 +1,215 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-claim-screen -- migrate the Plasma panel and wallpaper
+# onto the KRdp virtual output so mstsc shows the user's real desktop
+# (panel, taskbar, wallpaper, widgets) instead of a blank default.
+#
+# THE PROBLEM
+# -----------
+# Plasma binds each containment (panel, desktop wallpaper, widgets)
+# to a specific output via the output's connector name. When mstsc
+# connects, KRdp creates a brand-new virtual output -- so plasmashell
+# spins up a *fresh* containment for it: default Kubuntu wallpaper,
+# no panel, no widgets. The user's actual panel and populated desktop
+# stay on the now-invisible Virtual-1 output. Disabling Virtual-1
+# does not migrate the populated containment; it just leaves it
+# stranded. Plasma 6 only auto-migrates containments when it cannot
+# find a screen for them by exact connector match.
+#
+# THE FIX
+# -------
+# Use Plasma's scripting API ("evaluateScript" on
+# org.kde.plasmashell /PlasmaShell) to:
+#
+#   1. Resolve the KRdp virtual's connector name to a Plasma screen
+#      index via screenForConnector(name).
+#   2. Copy the wallpaper config (Image, plugin, fill mode, dynamic
+#      day/night state) from the screen-0 desktop to the target
+#      desktop, then reloadConfig() so plasmashell repaints it.
+#   3. Reassign every panel's "screen" property to the target index,
+#      which is exactly what right-click -> "Move panel to Different
+#      Screen" does in the GUI.
+#
+# This leaves Virtual-1 enabled (the user is on a TTY anyway, so the
+# physical display is dark) but makes mstsc show their real desktop.
+# If you also want to disable physical outputs, run this *first* then
+# call consolerdp-isolate-krdp-output.
+#
+# USAGE
+#   consolerdp-claim-screen                # auto-find KRDP virtual
+#   consolerdp-claim-screen <connector>    # explicit connector name
+#   consolerdp-claim-screen --revert       # move panel back to screen 0
+
+set -euo pipefail
+
+OUTPUT_TOOL=/usr/bin/consolerdp-output
+
+usage() {
+    sed -n '1,/^set -euo/p' "$0" | sed -n 's/^# \?//p'
+}
+
+REVERT=0
+EXPLICIT_NAME=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --revert)      REVERT=1; shift ;;
+        --help|-h)     usage; exit 0 ;;
+        --*)           echo "unknown option: $1" >&2; exit 64 ;;
+        *)             EXPLICIT_NAME="$1"; shift ;;
+    esac
+done
+
+# ---- find KRdp virtual connector name ----
+find_krdp_connector() {
+    if [[ -n "$EXPLICIT_NAME" ]]; then
+        echo "$EXPLICIT_NAME"; return
+    fi
+    if [[ ! -x "$OUTPUT_TOOL" ]]; then
+        echo "missing $OUTPUT_TOOL" >&2; return 1
+    fi
+    "$OUTPUT_TOOL" list 2>/dev/null \
+      | awk '/ENABLED/ && $1 ~ /KRDP-virtual-/ { print $1; exit }'
+}
+
+if [[ "$REVERT" -eq 1 ]]; then
+    TARGET_INDEX=0
+    echo "consolerdp-claim-screen: reverting panel to screen 0" >&2
+else
+    CONNECTOR=$(find_krdp_connector || true)
+    if [[ -z "$CONNECTOR" ]]; then
+        echo "consolerdp-claim-screen: no KRDP-virtual-* output found" >&2
+        echo "  connect mstsc first, or pass an explicit connector name" >&2
+        exit 2
+    fi
+    echo "consolerdp-claim-screen: target connector = $CONNECTOR" >&2
+fi
+
+# ---- build the Plasma script ----
+# Note: heredoc is "double-quoted" (no -E) so $-vars expand from bash;
+# JS-side $ uses \$ to be safe, but we don't actually use any.
+run_plasma_script() {
+    qdbus6 org.kde.plasmashell /PlasmaShell evaluateScript "$1"
+}
+
+# ---- revert path ----
+if [[ "$REVERT" -eq 1 ]]; then
+    run_plasma_script '
+var target = 0;
+var lines = [];
+function L(s){ lines.push(String(s)); }
+panels().forEach(function(p, i){
+    L("panel "+i+" screen "+p.screen+" -> "+target);
+    p.writeConfig("lastScreen", target);
+    p.reloadConfig();
+    p.screen = target;
+    L("  now screen="+p.screen+" lastScreen="+p.readConfig("lastScreen"));
+});
+print(lines.join("\n"));
+'
+    exit 0
+fi
+
+# ---- claim path: retry until target resolves and panel moves ----
+# Plasma may lag behind KWin by ~100-500ms when the virtual is registered;
+# retry screenForConnector() for up to ~5s.
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    OUT=$(run_plasma_script "
+var connector = \"$CONNECTOR\";
+var target = screenForConnector(connector);
+var lines = [];
+function L(s){ lines.push(String(s)); }
+L(\"attempt=$attempt connector=\" + connector + \" target=\" + target);
+if (target < 0) {
+    L(\"RETRY\");
+} else {
+    // ---- migrate wallpaper ----
+    var ds = desktops();
+    var src = null, dst = null;
+    for (var i = 0; i < ds.length; i++) {
+        if (ds[i].screen === 0) src = ds[i];
+        if (ds[i].screen === target) dst = ds[i];
+    }
+    L(\"src desktop screen=0 id=\" + (src ? src.id : \"none\") + \" plugin=\" + (src ? src.containmentType : \"?\"));
+    L(\"dst desktop screen=\" + target + \" id=\" + (dst ? dst.id : \"none\") + \" plugin=\" + (dst ? dst.containmentType : \"?\"));
+    // Strategy: SWAP the containments. The host's containment (src)
+    // already has the right plugin type (e.g. org.kde.plasma.folder
+    // with ~/Desktop icons), wallpaper, widgets, etc. By moving it to
+    // the KRDP screen we get everything at once -- icons included.
+    // The stub containment (dst) created by Plasma for the new output
+    // moves to screen 0, where the user isn't looking anyway.
+    //
+    // If the swap API isn't honoured by Plasma, fall back to copying
+    // the wallpaper keys (pre-swap behaviour).
+    var swapped = false;
+    if (src && dst && src.id !== dst.id) {
+        try {
+            // Plasma scripting: desktop.screen is settable in 5.x/6.x.
+            // Setting it re-parents the containment to a different
+            // output. Do dst first so src doesn't collide with itself.
+            dst.screen = 0;
+            src.screen = target;
+            L(\"swapped: src.screen now \" + src.screen + \" dst.screen now \" + dst.screen);
+            if (src.screen === target) {
+                swapped = true;
+                L(\"containment swap OK -- icons and widgets should follow\");
+            } else {
+                L(\"WARN swap assigned but src.screen did not stick\");
+            }
+        } catch (e) {
+            L(\"swap error: \" + e);
+        }
+    }
+    // Fallback: if swap didn't happen (or src/dst same), at least copy
+    // wallpaper onto whatever desktop is on the target screen.
+    if (!swapped && src && dst && src.id !== dst.id) {
+        try {
+            dst.wallpaperPlugin = src.wallpaperPlugin;
+            src.currentConfigGroup = [\"Wallpaper\", src.wallpaperPlugin, \"General\"];
+            dst.currentConfigGroup = [\"Wallpaper\", src.wallpaperPlugin, \"General\"];
+            var keys = [\"Image\",\"FillMode\",\"DynamicMode\",\"DarkLightScheduleState\",
+                        \"Color\",\"Blur\",\"PreviewImage\",\"SlidePaths\",\"SlideInterval\"];
+            for (var k = 0; k < keys.length; k++) {
+                var v = src.readConfig(keys[k]);
+                if (v !== undefined && v !== null && v !== \"\") {
+                    dst.writeConfig(keys[k], v);
+                    L(\"  copied \" + keys[k]);
+                }
+            }
+            dst.reloadConfig();
+            L(\"wallpaper migrated (fallback path)\");
+        } catch (e) {
+            L(\"wallpaper migration error: \" + e);
+        }
+    } else if (!dst) {
+        L(\"WARN no desktop bound to screen \" + target + \"; Plasma hasn't created containment yet\");
+    }
+    // ---- move panels ----
+    panels().forEach(function(p, i){
+        var was = p.screen;
+        // Write persisted lastScreen, reload, then set screen property.
+        // This is the combination that replicates right-click ->
+        // 'Move panel to Different Screen' in the GUI.
+        p.writeConfig(\"lastScreen\", target);
+        p.reloadConfig();
+        p.screen = target;
+        L(\"panel \" + i + \" screen \" + was + \" -> \" + p.screen +
+          \" (lastScreen=\" + p.readConfig(\"lastScreen\") + \")\");
+    });
+    L(\"DONE\");
+}
+print(lines.join(\"\n\"));
+")
+    echo "$OUT"
+    if [[ "$OUT" == *RETRY* ]]; then
+        sleep 0.5
+        continue
+    fi
+    if [[ "$OUT" == *DONE* ]]; then
+        exit 0
+    fi
+    break
+done
+
+echo "consolerdp-claim-screen: giving up after $attempt attempts" >&2
+exit 3

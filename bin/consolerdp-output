@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""
+consolerdp-output -- enable/disable Wayland outputs on a KDE Plasma session.
+
+Plasma's official CLI for this (kscreen-doctor) is broken on Plasma 6.6
+because libkscreen-bin and the running kscreend are out of sync over the
+"brightness" key in the output map. Every libkscreen-based call dies with
+"Config is invalid, probably backend couldn't load" before applying any
+change. Until upstream fixes that, ConsoleRDP has to talk to KWin's
+output management protocol directly.
+
+Why this matters for ConsoleRDP:
+
+  When mstsc connects with --virtual-monitor client, krdpserver creates a
+  brand-new KWin output of the requested size. KWin treats it as an
+  *extended* desktop, not a mirror, so the user's panel/wallpaper/apps
+  stay on the physical output and the RDP client sees an empty desktop
+  with the default Plasma wallpaper. The way to make RDP look "100% the
+  same" as the local session is to disable the physical output once the
+  virtual one is up; KWin's "an output went away" handler relocates every
+  window (and Plasma reseats panels/wallpaper) onto the surviving output,
+  which is the virtual one being captured by krdp.
+
+  This tool is what consolerdp-daemon calls during takeover to disable
+  the physical output, and during reclaim to bring it back.
+
+Usage:
+  consolerdp-output list
+  consolerdp-output disable <NAME>
+  consolerdp-output enable  <NAME>
+  consolerdp-output disable-physical          # everything that isn't a krdp virtual
+  consolerdp-output enable-physical           # the inverse
+
+Exit code 0 = success, non-zero = failure (with stderr message).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+# pywayland-generated bindings live in a sibling directory. The bindings use
+# package-relative imports (``from ..kde_output_device_v2 import ...``) so we
+# need a *parent* package on sys.path, not the protocol directories themselves.
+sys.path.insert(0, "/usr/local/lib")
+
+from pywayland.client import Display  # noqa: E402
+from consolerdp_wayland.kde_output_management_v2 import KdeOutputManagementV2  # noqa: E402
+from consolerdp_wayland.kde_output_device_v2 import KdeOutputDeviceV2  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Output state tracking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OutputInfo:
+    """
+    Snapshot of the events emitted by a single kde_output_device_v2 between
+    one done() and the next. KWin sends every property as a separate event
+    and only commits the change with done(); we mirror that here.
+    """
+    proxy: KdeOutputDeviceV2
+    name: str = ""
+    make: str = ""
+    model: str = ""
+    serial: str = ""
+    uuid: str = ""
+    enabled: int = 0
+    width: int = 0
+    height: int = 0
+    # True once we have seen a current_mode event for this output. Used as
+    # the "is this output live?" signal: stale virtual outputs left over
+    # from a closed screencast session typically lose their current mode
+    # while still showing up in the registry as enabled, and KWin will
+    # refuse to leave only such an output enabled.
+    has_current_mode: bool = False
+    # Hard reference to the kde_output_device_mode_v2 proxy KWin sent for
+    # the current mode, so pywayland's cffi layer doesn't GC it while
+    # follow-up events (size, refresh, etc.) are still being delivered on
+    # it. We never read those events directly but holding the reference
+    # silences the noisy "was it garbage collected" tracebacks.
+    current_mode_proxy: object = None
+    # Every mode proxy KWin announces via the ``mode`` event, in arrival
+    # order. KWin always sends one ``mode`` per supported resolution
+    # *before* it sends ``current_mode`` referring to one of them, so we
+    # have to subscribe to the former and keep the proxies alive --
+    # otherwise pywayland's cffi layer GCs them and the subsequent
+    # ``current_mode`` dispatch fails with a confusing "was it garbage
+    # collected" RuntimeError before our handler ever sees the event.
+    all_modes: List[Any] = field(default_factory=list)
+    # Set to True once we have seen at least one done() event so the caller
+    # knows the snapshot above represents a coherent configuration.
+    ready: bool = False
+
+    def is_virtual(self) -> bool:
+        """
+        Decide whether this output represents a screencast-created virtual
+        sink (which we want to leave enabled during takeover) versus a
+        physical/DRM connector (which we want to disable so KWin moves all
+        the windows to the surviving virtual output).
+
+        Empirically, the two virtual paths that matter to ConsoleRDP each
+        leave a *different* fingerprint on the output:
+
+          * XDG portal (``PortalSession`` in krdp): non-empty model string
+            ``Virtual Output (shared with KRdp)`` and a name that begins
+            ``Virtual-virtual-xdp-kde-``.
+          * Plasma native screencast (``PlasmaScreencastV1Session``):
+            **empty** model string, but the *name* is whatever was passed
+            to ``createVirtualMonitorStream``. Our --virtual-monitor
+            client patch (0002 patch in build/krdp-6.6.4/debian/patches)
+            sets that to ``KRDP-virtual-WIDTHxHEIGHT``.
+          * Physical/DRM connectors always have a non-empty model string
+            (``Virtual-1-unknown``, ``HDMI-A-1-Acer P246HL``, etc.) even
+            on virtio-gpu/QEMU hosts where the *name* happens to be
+            ``Virtual-1``.
+            
+        So we check name-prefixes first (catches both krdp paths regardless
+        of model contents) and fall back to model substrings as a
+        belt-and-braces guard for any future protocol that names its
+        outputs differently.
+        """
+        name_lower = self.name.lower()
+        # KWin prepends its own "Virtual-" to any kde_output_device_v2 that
+        # the underlying KOutput doesn't have a DRM connector name for --
+        # our --plasma virtual ends up reported as e.g.
+        # ``Virtual-KRDP-virtual-1024x768`` rather than the bare
+        # ``KRDP-virtual-1024x768`` we set. Use substring instead of
+        # startswith so both forms match.
+        if "krdp-virtual-" in name_lower:               # --plasma path (our 0002 patch)
+            return True
+        if "virtual-xdp-" in name_lower:                # XDG portal path
+            return True
+
+        model_lower = self.model.lower()
+        if "virtual output" in model_lower:              # XDG portal model fallback
+            return True
+        if "shared with krdp" in model_lower:            # belt-and-braces
+            return True
+        return False
+
+
+class WaylandSession:
+    """
+    Manages the wayland display connection plus the registry/global bookkeeping
+    needed to drive kde_output_management_v2.
+    """
+
+    def __init__(self) -> None:
+        self.display = Display()
+        self.display.connect()
+        self.registry = self.display.get_registry()
+        self.registry.dispatcher["global"] = self._on_global
+        self.registry.dispatcher["global_remove"] = self._on_global_remove
+
+        self.management: Optional[KdeOutputManagementV2] = None
+        # outputs keyed by registry name (the integer id, not the device name)
+        self.outputs: Dict[int, OutputInfo] = {}
+        # Pending event accumulators keyed by KdeOutputDeviceV2 proxy id.
+        # We need this because device events arrive between done() boundaries
+        # and we shouldn't surface half-applied state.
+        self._pending: Dict[int, OutputInfo] = {}
+
+        # Initial roundtrip to populate the registry list.
+        self.display.dispatch(block=True)
+        self.display.roundtrip()
+        # Second roundtrip lets per-output events fire after we bound them.
+        self.display.roundtrip()
+
+    # -- registry handlers -----------------------------------------------
+
+    def _on_global(self, registry, name: int, interface: str, version: int) -> None:
+        if interface == "kde_output_management_v2":
+            # Bind the highest version we generated bindings for. Asking for
+            # too high a version would error out; pywayland clamps to the
+            # interface's declared version, which matches the XML we used.
+            self.management = registry.bind(name, KdeOutputManagementV2, version)
+        elif interface == "kde_output_device_v2":
+            device = registry.bind(name, KdeOutputDeviceV2, version)
+            info = OutputInfo(proxy=device)
+            self.outputs[name] = info
+            self._pending[id(device)] = info
+            device.dispatcher["name"] = self._mk_name_handler(info)
+            device.dispatcher["enabled"] = self._mk_enabled_handler(info)
+            device.dispatcher["geometry"] = self._mk_geometry_handler(info)
+            device.dispatcher["uuid"] = self._mk_uuid_handler(info)
+            # Subscribe to BOTH ``mode`` and ``current_mode``. The former
+            # gives us one event per supported mode (we just stash the
+            # proxy to keep it alive); the latter is what actually tells
+            # us KWin has a current mode for this output. See the
+            # OutputInfo.all_modes field comment for why we have to do
+            # both -- subscribing to current_mode alone is not enough
+            # because pywayland will already have GC'd the mode proxy
+            # being referenced by the time the dispatch fires.
+            device.dispatcher["mode"] = self._mk_mode_handler(info)
+            device.dispatcher["current_mode"] = self._mk_current_mode_handler(info)
+            device.dispatcher["serial_number"] = self._mk_serial_handler(info)
+            device.dispatcher["done"] = self._mk_done_handler(info)
+
+    def _on_global_remove(self, registry, name: int) -> None:
+        # An output going away is normal during takeover/reclaim. We don't
+        # need to react here because callers re-list before each operation.
+        self.outputs.pop(name, None)
+
+    # -- per-event handlers (closures keep `info` in scope) -------------
+
+    def _mk_name_handler(self, info: OutputInfo):
+        def handler(_proxy, name: str) -> None:
+            info.name = name
+        return handler
+
+    def _mk_enabled_handler(self, info: OutputInfo):
+        def handler(_proxy, enabled: int) -> None:
+            info.enabled = enabled
+        return handler
+
+    def _mk_geometry_handler(self, info: OutputInfo):
+        def handler(_proxy, x, y, pw, ph, sub, make, model, transform) -> None:
+            info.make = make
+            info.model = model
+        return handler
+
+    def _mk_serial_handler(self, info: OutputInfo):
+        def handler(_proxy, serial: str) -> None:
+            info.serial = serial
+        return handler
+
+    def _mk_uuid_handler(self, info: OutputInfo):
+        def handler(_proxy, uuid: str) -> None:
+            info.uuid = uuid
+        return handler
+
+    def _mk_mode_handler(self, info: OutputInfo):
+        def handler(_proxy, mode_proxy) -> None:
+            # We don't care what's *in* the mode (size/refresh) -- we
+            # only need to anchor the Python wrapper so pywayland's
+            # cffi-side proxy doesn't get torn down before KWin sends
+            # the current_mode event referencing this same proxy.
+            info.all_modes.append(mode_proxy)
+        return handler
+
+    def _mk_current_mode_handler(self, info: OutputInfo):
+        def handler(_proxy, mode_proxy) -> None:
+            info.has_current_mode = True
+            # Hold the proxy on the info object so it lives at least as
+            # long as the device. See the dataclass field comment.
+            info.current_mode_proxy = mode_proxy
+        return handler
+
+    def _mk_done_handler(self, info: OutputInfo):
+        def handler(_proxy) -> None:
+            info.ready = True
+        return handler
+
+    # -- public surface --------------------------------------------------
+
+    def settle(self, timeout_seconds: float = 2.0) -> None:
+        """
+        Roundtrip until every known output has fired its first done() event,
+        or until the timeout expires. KWin sends one done() per output after
+        all initial property events; without waiting we can race on partially
+        populated names.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            self.display.roundtrip()
+            if self.outputs and all(o.ready for o in self.outputs.values()):
+                return
+        # We don't raise on timeout: callers can still see the partial state
+        # via list_outputs() and decide for themselves.
+
+    def list_outputs(self) -> List[OutputInfo]:
+        return [o for o in self.outputs.values() if o.ready]
+
+    def find_by_name(self, name: str) -> Optional[OutputInfo]:
+        for info in self.outputs.values():
+            if info.name == name:
+                return info
+        return None
+
+    def apply_enable(self,
+                     targets: List,
+                     new_primary: Optional[OutputInfo] = None) -> int:
+        """
+        Build a single kde_output_configuration_v2 that flips the enabled
+        flag on each target (and optionally promotes ``new_primary`` to
+        primary), fire it off, and wait for KWin to ack it.
+
+        ``targets`` is a list of ``(OutputInfo, bool)`` tuples. We use a
+        list rather than a dict keyed by OutputInfo because OutputInfo is
+        a non-frozen dataclass and therefore unhashable; freezing it
+        would force us to pre-compute every observed field at construction
+        time, which conflicts with the wayland event-driven flow.
+
+        ``new_primary`` matters because KWin will reject any configuration
+        that disables the current primary output without simultaneously
+        promoting another output to primary -- this is the most common
+        cause of ``failed`` when a caller tries to disable Virtual-1 while
+        a virtual screencast output is the only other option. Bundling
+        the set_primary_output() call into the same configuration as the
+        enable() flips lets KWin validate the whole transition atomically.
+
+        Returns 0 on applied, 1 on failed, 2 on timeout. We use a single
+        configuration object rather than one per output because KWin
+        validates the whole set atomically; flipping outputs one at a time
+        risks landing in a "no enabled outputs" state mid-sequence.
+        """
+        if self.management is None:
+            print("error: compositor did not advertise kde_output_management_v2",
+                  file=sys.stderr)
+            return 1
+
+        config = self.management.create_configuration()
+
+        result = {"status": None}
+        config.dispatcher["applied"] = lambda _p: result.update(status="applied")
+        config.dispatcher["failed"] = lambda _p: result.update(status="failed")
+
+        # Order matters here: KWin processes the requests in the order
+        # they're queued. Promoting the new primary BEFORE flipping any
+        # enabled bits means the configuration is internally consistent
+        # at every intermediate validation step KWin runs.
+        if new_primary is not None:
+            config.set_primary_output(new_primary.proxy)
+        for info, want_enabled in targets:
+            config.enable(info.proxy, 1 if want_enabled else 0)
+        config.apply()
+        self.display.flush()
+
+        deadline = time.monotonic() + 5.0
+        while result["status"] is None and time.monotonic() < deadline:
+            self.display.dispatch(block=False)
+            self.display.roundtrip()
+            time.sleep(0.05)
+
+        if result["status"] == "applied":
+            return 0
+        if result["status"] == "failed":
+            print("error: KWin rejected the output configuration", file=sys.stderr)
+            return 1
+        print("error: timed out waiting for KWin to ack the configuration",
+              file=sys.stderr)
+        return 2
+
+    def close(self) -> None:
+        try:
+            self.display.disconnect()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Environment auto-detection
+# ---------------------------------------------------------------------------
+
+def _ensure_wayland_env() -> None:
+    """
+    Populate XDG_RUNTIME_DIR and WAYLAND_DISPLAY so pywayland can connect.
+
+    Resolution order:
+      1. Honour whatever the caller already set; never override existing
+         values, since an explicit override is how consolerdp-daemon will
+         eventually point us at a specific user's session.
+      2. Otherwise, derive the runtime dir from the *invoking* uid via
+         ``/run/user/<uid>``. Note this uses geteuid(), so when sudo is in
+         the picture the value is the target user's uid (e.g. 1000), not
+         the original ``$SUDO_UID``.
+      3. If that directory has no wayland socket (e.g. we are uid 0
+         because consolerdp-daemon called us as root), scan ``/run/user/*``
+         for the first directory that does. There should normally be at
+         most one logged-in user with a Plasma session on a single-seat
+         box, which is the topology consolerdp targets.
+      4. WAYLAND_DISPLAY defaults to ``wayland-0``, matching KWin's default
+         and what every other Plasma helper assumes.
+    """
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        candidate = f"/run/user/{os.geteuid()}"
+        if not _has_wayland_socket(candidate):
+            candidate = _find_any_user_runtime_dir() or candidate
+        os.environ["XDG_RUNTIME_DIR"] = candidate
+
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+
+
+def _has_wayland_socket(runtime_dir: str) -> bool:
+    try:
+        return any(name.startswith("wayland-") and not name.endswith(".lock")
+                   for name in os.listdir(runtime_dir))
+    except OSError:
+        return False
+
+
+def _find_any_user_runtime_dir() -> Optional[str]:
+    try:
+        candidates = sorted(os.listdir("/run/user"))
+    except OSError:
+        return None
+    # Skip uid 0 because root almost never owns the session we want to talk
+    # to, and starting with the lowest non-zero uid usually picks up the
+    # primary interactive user (uid 1000 on Ubuntu, etc.).
+    for name in candidates:
+        if name == "0":
+            continue
+        path = f"/run/user/{name}"
+        if _has_wayland_socket(path):
+            return path
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Subcommand implementations
+# ---------------------------------------------------------------------------
+
+def cmd_list(session: WaylandSession) -> int:
+    rows = session.list_outputs()
+    if not rows:
+        print("(no outputs reported)")
+        return 0
+    width = max(len(o.name) for o in rows)
+    for o in rows:
+        kind = "virtual " if o.is_virtual() else "physical"
+        flag = "ENABLED " if o.enabled else "disabled"
+        live = "live " if o.has_current_mode else "stale"
+        print(f"{o.name:<{width}}  {flag}  {kind}  {live}  "
+              f"model={o.model!r}  uuid={o.uuid}")
+    return 0
+
+
+def cmd_enable_one(session: WaylandSession, name: str, on: bool) -> int:
+    info = session.find_by_name(name)
+    if info is None:
+        print(f"error: no output named {name!r}", file=sys.stderr)
+        return 1
+    if bool(info.enabled) == on:
+        # No-op already; KWin is happy to apply this but we keep the diagnostic.
+        print(f"note: {name} is already {'enabled' if on else 'disabled'}")
+        return 0
+    return session.apply_enable([(info, on)])
+
+
+def cmd_bulk_physical(session: WaylandSession, on: bool) -> int:
+    physical = [o for o in session.list_outputs() if not o.is_virtual()]
+    if not physical:
+        print("error: no physical outputs detected", file=sys.stderr)
+        return 1
+
+    if on:
+        # Enabling path: re-enable any disabled physical outputs and
+        # promote the first one back to primary so plasmashell, panels,
+        # and DPI scaling all snap back to their normal home. We do this
+        # even if all physical are already enabled, because a previous
+        # disable-physical may have left a virtual marked as primary.
+        targets = [(o, True) for o in physical if not o.enabled]
+        new_primary = physical[0]
+        if not targets:
+            # Still issue the set-primary so we don't leave a stale
+            # virtual marked primary after a reclaim.
+            print("note: physical outputs already enabled; just restoring primary")
+            return session.apply_enable([], new_primary=new_primary)
+        return session.apply_enable(targets, new_primary=new_primary)
+
+    # Disabling path. KWin will reject the configuration unless we:
+    #   1. leave at least one output enabled, AND
+    #   2. promote that output to primary in the same atomic config
+    #      (you can't disable the current primary without picking a
+    #      successor first).
+    #
+    # We go further than just "disable physicals": we disable every
+    # enabled output EXCEPT the chosen primary. That means physicals
+    # plus stale leftover virtuals (old XDG-portal Virtual Outputs from
+    # previous krdp sessions, duplicate KRDP virtuals from a second
+    # mstsc connection, etc.) all go away atomically. The motivation:
+    # if we leave a stale virtual enabled alongside the live one and
+    # disable only physicals, KWin's window reflow moves same-sized
+    # windows to the stale virtual by coordinate proximity instead of
+    # onto the primary. That was observed to strand all apps on a
+    # virtual nobody is streaming, while the primary KRDP virtual --
+    # the one mstsc is actually viewing -- ends up with an empty
+    # containment. See docs/architecture/output-management.md for the
+    # full rationale.
+    all_outputs = session.list_outputs()
+    enabled_virtuals = [o for o in all_outputs if o.is_virtual() and o.enabled]
+    live_virtuals = [o for o in enabled_virtuals if o.has_current_mode]
+
+    # Prefer krdp-virtual- named outputs: those come from our 0002
+    # --virtual-monitor client path and are the ONLY ones that are
+    # backed by a live mstsc pipewire feed in --plasma mode. XDG portal
+    # leftovers (``virtual-xdp-``) are always stale when krdp is running
+    # with --plasma. Among multiple KRDP virtuals (which happens when a
+    # second mstsc connection came in before the first was torn down),
+    # we pick the most recently bound one (-1 in wayland registration
+    # order) because that's the one the newest connection is consuming.
+    krdp_virtuals = [o for o in live_virtuals
+                     if "krdp-virtual-" in o.name.lower()]
+
+    if krdp_virtuals:
+        new_primary = krdp_virtuals[-1]
+        print(f"selected live KRDP virtual {new_primary.name!r} as new primary "
+              f"(uuid={new_primary.uuid})")
+    elif live_virtuals:
+        new_primary = live_virtuals[-1]
+        print(f"note: no krdp-virtual- output found; falling back to "
+              f"{new_primary.name!r}")
+    elif enabled_virtuals:
+        new_primary = enabled_virtuals[-1]
+        print(f"warning: no virtual has a live current_mode; "
+              f"falling back to {new_primary.name!r} which may be stale",
+              file=sys.stderr)
+    else:
+        print("error: refusing to disable physical outputs because no "
+              "virtual output is currently enabled (KWin would reject "
+              "an all-disabled configuration -- is mstsc connected?)",
+              file=sys.stderr)
+        return 1
+
+    # Disable every enabled output except the chosen primary. Use uuid
+    # rather than (name, mode) to disambiguate duplicates: KDE sometimes
+    # reports the same output twice if a second screencast session
+    # registered while the first was still binding. We dedupe on uuid
+    # because sending two disable-device configs for the same output
+    # trips KWin's "you can't configure the same head twice" guard.
+    seen_uuids = {new_primary.uuid}
+    targets: List[Tuple[OutputInfo, bool]] = []
+    for o in all_outputs:
+        if not o.enabled or o.uuid in seen_uuids:
+            continue
+        seen_uuids.add(o.uuid)
+        targets.append((o, False))
+    if not targets:
+        print("note: nothing to do (only the chosen primary is enabled)")
+        return 0
+    phys_count = sum(1 for o, _ in targets if not o.is_virtual())
+    virt_count = sum(1 for o, _ in targets if o.is_virtual())
+    print(f"disabling {phys_count} physical and {virt_count} other "
+          f"virtual output(s) alongside primary promotion")
+    return session.apply_enable(targets, new_primary=new_primary)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Enable/disable Wayland outputs on KDE Plasma 6 (KWin) "
+                    "via the kde_output_management_v2 protocol.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="list known outputs")
+    p_dis = sub.add_parser("disable", help="disable a specific output by name")
+    p_dis.add_argument("name")
+    p_en = sub.add_parser("enable", help="enable a specific output by name")
+    p_en.add_argument("name")
+    sub.add_parser("disable-physical",
+                   help="disable every output that is not a krdp virtual one")
+    sub.add_parser("enable-physical",
+                   help="re-enable every physical output that is currently disabled")
+    args = parser.parse_args(argv)
+
+    # We can be invoked from many contexts:
+    #   * directly by the user (XDG_RUNTIME_DIR is normally set by pam_systemd)
+    #   * from a sudo prompt with no env preserved
+    #   * from consolerdp-daemon (running as root with no user env in scope)
+    #
+    # In every case the wayland socket lives at /run/user/<uid>/wayland-N for
+    # the *user* whose Plasma session we want to talk to, so resolve that
+    # explicitly here instead of relying on whatever inherited env we may or
+    # may not have. pywayland reads XDG_RUNTIME_DIR + WAYLAND_DISPLAY at
+    # connect() time, so it's enough to mutate os.environ before constructing
+    # the WaylandSession.
+    _ensure_wayland_env()
+
+    try:
+        session = WaylandSession()
+    except Exception as exc:
+        print(f"error: failed to connect to wayland: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        session.settle()
+        if args.cmd == "list":
+            return cmd_list(session)
+        if args.cmd == "disable":
+            return cmd_enable_one(session, args.name, on=False)
+        if args.cmd == "enable":
+            return cmd_enable_one(session, args.name, on=True)
+        if args.cmd == "disable-physical":
+            return cmd_bulk_physical(session, on=False)
+        if args.cmd == "enable-physical":
+            return cmd_bulk_physical(session, on=True)
+        parser.error(f"unknown command {args.cmd!r}")
+        return 2
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

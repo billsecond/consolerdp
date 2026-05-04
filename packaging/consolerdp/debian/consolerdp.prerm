@@ -1,0 +1,29 @@
+#!/bin/sh
+# prerm -- stop services before removing any files.
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop consolerdp.service 2>/dev/null || true
+            # Best-effort: stop all greeter instances.
+            for unit in $(systemctl list-units --no-legend \
+                          'consolerdp-greeter@*' 2>/dev/null \
+                          | awk '{print $1}'); do
+                systemctl stop "$unit" 2>/dev/null || true
+            done
+        fi
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

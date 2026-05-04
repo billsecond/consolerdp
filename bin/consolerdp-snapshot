@@ -1,0 +1,158 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-snapshot -- capture a reproducible tarball of the
+# currently working ConsoleRDP setup. Saves it to ./snapshots/.
+#
+# WHAT GOES IN
+#   * patched krdp .deb from build/
+#   * all bin/consolerdp-* helper scripts
+#   * patches/ directory (krdp source patches)
+#   * systemd/ user + system units
+#   * config/ KDE & systemd config snippets
+#   * MANIFEST.txt with: git HEAD, dpkg versions, sha256s, kernel,
+#     Plasma version, summary of what's verified working
+#
+# USAGE
+#   consolerdp-snapshot [TAG]
+#       TAG: optional label appended to the filename. Defaults to
+#       "snapshot". E.g. "consolerdp-snapshot panel-working" produces
+#       snapshots/snapshot-panel-working-YYYYMMDD-HHMMSS.tar.gz
+#
+# Read-only: never modifies anything outside ./snapshots/.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TAG="${1:-snapshot}"
+TS="$(date +%Y%m%d-%H%M%S)"
+NAME="${TAG}-${TS}"
+SNAP_DIR="$REPO_ROOT/snapshots"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+OUT="$WORK_DIR/$NAME"
+mkdir -p "$OUT"
+mkdir -p "$SNAP_DIR"
+
+cd "$REPO_ROOT"
+
+# ---- 1. helper scripts -------------------------------------------
+mkdir -p "$OUT/bin"
+cp -a bin/consolerdp-* "$OUT/bin/" 2>/dev/null || true
+# strip the python __pycache__ stuff
+rm -rf "$OUT/bin/__pycache__"
+
+# ---- 2. patches --------------------------------------------------
+if [[ -d patches ]]; then
+    cp -a patches "$OUT/patches"
+fi
+
+# ---- 3. systemd units --------------------------------------------
+mkdir -p "$OUT/systemd"
+[[ -d systemd ]]   && cp -a systemd/.   "$OUT/systemd/"   2>/dev/null || true
+
+mkdir -p "$OUT/config"
+[[ -d config  ]]   && cp -a config/.    "$OUT/config/"    2>/dev/null || true
+
+# ---- 4. patched .deb files ---------------------------------------
+mkdir -p "$OUT/debs"
+shopt -s nullglob
+for f in build/*consolerdp*.deb build/*consolerdp*.changes build/*.dsc; do
+    cp -a "$f" "$OUT/debs/"
+done
+shopt -u nullglob
+
+# ---- 5. snapshot of installed binaries (their on-disk versions) --
+mkdir -p "$OUT/installed"
+for f in /usr/bin/consolerdp-* /usr/sbin/consolerdp-*; do
+    [[ -f "$f" ]] || continue
+    cp -a "$f" "$OUT/installed/"
+done
+
+# ---- 6. installed user systemd unit ------------------------------
+USER_UNIT="$HOME/.config/systemd/user/consolerdp-session-watcher.service"
+if [[ -f "$USER_UNIT" ]]; then
+    mkdir -p "$OUT/installed-systemd-user"
+    cp -a "$USER_UNIT" "$OUT/installed-systemd-user/"
+fi
+
+# ---- 7. MANIFEST -------------------------------------------------
+M="$OUT/MANIFEST.txt"
+{
+    echo "ConsoleRDP snapshot"
+    echo "==================="
+    echo "Tag           : $TAG"
+    echo "Timestamp     : $TS"
+    echo "Host          : $(hostname)"
+    echo "Kernel        : $(uname -r)"
+    echo "Distro        : $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d \")"
+    echo "Plasma        : $(plasmashell --version 2>/dev/null | head -1 || echo '?')"
+    echo "KWin          : $(kwin_wayland --version 2>/dev/null | head -1 || echo '?')"
+    echo
+    echo "Repo state"
+    echo "----------"
+    echo "Git HEAD      : $(git rev-parse HEAD 2>/dev/null || echo 'no-git')"
+    echo "Git branch    : $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    echo "Tree status   :"
+    git status --porcelain 2>/dev/null | sed 's/^/    /'
+    echo
+    echo "Installed packages (relevant)"
+    echo "-----------------------------"
+    dpkg -l krdp kwin-wayland kwin-common plasma-workspace 2>/dev/null \
+      | awk '/^ii/ {printf "  %-30s %s\n", $2, $3}'
+    echo
+    echo "Patched krdp"
+    echo "------------"
+    apt-cache policy krdp 2>/dev/null | sed 's/^/  /'
+    echo
+    echo "User systemd unit"
+    echo "-----------------"
+    systemctl --user is-active   consolerdp-session-watcher 2>&1 \
+      | sed 's/^/  is-active   : /'
+    systemctl --user is-enabled  consolerdp-session-watcher 2>&1 \
+      | sed 's/^/  is-enabled  : /'
+    echo
+    echo "SHA256 of bundled bin/"
+    echo "----------------------"
+    (cd "$OUT" && find bin installed debs -type f -print0 2>/dev/null \
+      | xargs -0 sha256sum 2>/dev/null | sort)
+    echo
+    echo "Verified working at this snapshot"
+    echo "---------------------------------"
+    cat <<'NOTES'
+* mstsc -> KRdp negotiates resolution dynamically (mstsc client width/height)
+* KRdp virtual output created on connect (resolution patch 0007)
+* Plasma panel migrates to KRDP virtual via consolerdp-claim-screen
+* Wallpaper config copies from screen 0 to KRDP virtual desktop
+* Newly-opened windows land on KRDP virtual via consolerdp-corral-windows --watch
+* Clipboard text round-trips host <-> mstsc (patch 0008)
+* Auto-claim/corral on mstsc connect via consolerdp-session-watcher.service
+NOTES
+    echo
+    echo "Known issues at this snapshot"
+    echo "-----------------------------"
+    cat <<'NOTES'
+* Pre-existing windows running on Virtual-1 BEFORE mstsc connect are
+  NOT auto-corralled; user must close & reopen them or run
+  consolerdp-corral-windows manually after the panel migration.
+* Color rendering in mstsc is slightly off (dark tones grayer than on
+  the physical display); likely 8-bit RGB encoding or sRGB pipeline.
+* Watcher logs are only viewable from a separate console
+  (Hyper-V / SSH); no in-mstsc tail.
+NOTES
+} > "$M"
+
+# ---- 8. tar it up ------------------------------------------------
+ARCHIVE="$SNAP_DIR/$NAME.tar.gz"
+tar -C "$WORK_DIR" -czf "$ARCHIVE" "$NAME"
+SIZE=$(du -h "$ARCHIVE" | cut -f1)
+SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+
+echo
+echo "snapshot OK"
+echo "  $ARCHIVE  ($SIZE)"
+echo "  sha256 = $SHA"
+echo
+echo "manifest preview:"
+sed -n '1,40p' "$M" | sed 's/^/  /'

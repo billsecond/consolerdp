@@ -1,0 +1,104 @@
+Description: Translate virtual-monitor local pointer coords to global.
+ .
+ KWin interprets the coordinates carried by
+ ``org_kde_kwin_fake_input::pointer_motion_absolute`` as *global*
+ compositor coordinates. The relevant handler in KWin's
+ ``src/input.cpp`` connects the protocol request straight to
+ ``PointerInputRedirection::processMotion(const QPointF &pos,
+ uint32_t time)``, which takes a global position and does no further
+ translation based on which output a client might have thought it
+ was targeting. See for example the upstream pattern:
+ .
+     connect(device, &FakeInputDevice::pointerMotionAbsoluteRequested,
+             this, [this](const QPointF &pos) {
+         m_pointer->processMotion(pos, 0);
+         ...
+     });
+ .
+ KRdp's ``PlasmaScreencastV1Session::sendEvent`` computes the pointer
+ position in the pipewire stream's *local* pixel space:
+ .
+     auto logicalPosition = QPointF{
+         (position.x() / size().width())  * logicalSize().width(),
+         (position.y() / size().height()) * logicalSize().height()};
+ .
+ When KRdp is running as a dedicated RDP server on a machine that
+ also has a physical output (the normal desktop usage and the only
+ mode supported by the ``--virtual-monitor client`` flag), the new
+ virtual output is placed by KWin at some non-zero origin in the
+ compositor's global coordinate space -- typically right of every
+ existing output. On a workstation with a 1920x1080 physical
+ display, for example, KWin places a 1024x768 virtual output at
+ ``(1920, 0)`` or further right depending on how many other virtual
+ outputs are already active. Sending the untranslated local
+ coordinate ``(512, 384)`` therefore moves KWin's cursor to
+ ``(512, 384)`` on the physical output rather than to the centre of
+ the virtual output. Every click, keypress, and hot-corner trigger
+ then lands on whichever surface is under that global position --
+ usually a window on the host's own desktop, or the upper-left
+ Overview ("Present Windows") hot corner, which is why users see
+ Overview firing repeatedly as they move the mouse inside mstsc.
+ .
+ The mstsc-rendered cursor still follows the user's mouse because
+ Microsoft Remote Desktop draws its own local cursor from the
+ cursor-position data sent over the RDP pointer-update channel, so
+ the victim's screen looks *almost* correct: the cursor is where
+ you expect, the streamed frame shows the right windows, but clicks
+ and keystrokes silently miss. The symptom is very confusing.
+ .
+ This patch resolves the origin of the virtual output by walking
+ ``QGuiApplication::screens()`` and picking the QScreen whose size
+ matches the virtual monitor's resolution. The virtual monitor's
+ name gets mangled on the wl_output side by KWin (it's prefixed
+ with ``Virtual-`` and sometimes suffixed), so size is the most
+ reliable match when a session is running one virtual monitor at a
+ time. The origin is added to ``logicalPosition`` before the
+ ``pointer_motion_absolute`` request is sent.
+ .
+ Lookup is done lazily on each event rather than cached in
+ ``start()`` because of a timing hazard: the
+ ``ScreencastingStream::created`` callback runs as soon as KWin
+ acks the zkde_screencast stream, but KWin may emit the wl_output
+ globals describing the new output slightly later, so Qt's screen
+ list is not necessarily populated at the exact moment we would
+ cache the origin. Iterating over a handful of screens on each
+ mouse-move event is cheap and keeps the code obviously correct
+ regardless of binding order.
+ .
+ Button, axis, and key events do not carry coordinates in the
+ ``fake_input`` protocol (KWin uses the current cursor position for
+ button dispatch), so no translation is needed for those code paths.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-04-30
+Bug-KDE: not-yet (intent to file at https://bugs.kde.org/ once tested)
+
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -7,6 +7,7 @@
+ #include <QGuiApplication>
+ #include <QMouseEvent>
+ #include <QQueue>
++#include <QScreen>
+ #include <QWaylandClientExtensionTemplate>
+ #include <qpa/qplatformnativeinterface.h>
+ 
+@@ -234,6 +235,18 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         auto me = std::static_pointer_cast<QMouseEvent>(event);
+         auto position = me->position();
+         auto logicalPosition = QPointF{(position.x() / size().width()) * logicalSize().width(), (position.y() / size().height()) * logicalSize().height()};
++        // KWin's fake_input handler treats pointer_motion_absolute as
++        // a *global* compositor coordinate. We've computed a local
++        // coordinate inside our virtual output, so add the output's
++        // origin from Qt's screen list before sending.
++        if (auto vm = virtualMonitor()) {
++            for (auto screen : QGuiApplication::screens()) {
++                if (screen->size() == vm->size) {
++                    logicalPosition += screen->geometry().topLeft();
++                    break;
++                }
++            }
++        }
+         d->remoteInterface->pointer_motion_absolute(
+             wl_fixed_from_double(logicalPosition.x()),
+             wl_fixed_from_double(logicalPosition.y()));

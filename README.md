@@ -1,80 +1,133 @@
 # ConsoleRDP
 
-**Windows-style RDP for Linux: single seat, single session, seamless takeover.**
+**Windows-style RDP for Linux: one seat, one session, seamless takeover — on KDE Plasma 6 Wayland.**
 
-ConsoleRDP makes a Linux desktop behave like a Windows workstation with
-Remote Desktop enabled:
+ConsoleRDP makes a Kubuntu workstation behave like a Windows box with Remote
+Desktop enabled:
 
 - There is exactly **one** desktop session at any time.
-- Logging in physically opens the session on the attached monitor.
-- Connecting via RDP **takes the session over** — without prompting the
-  remote user, and without the remote user seeing the local screen.
-- The displaced side (local or remote) is shown a fresh login greeter.
+- Logging in at the physical console opens the session on the attached monitor.
+- Connecting via RDP **takes the session over** — the mstsc user sees the live
+  Plasma desktop, and the physical display flips to a greeter login banner.
+- Disconnecting mstsc locks the session. Reconnecting auto-unlocks (NLA
+  already authenticated you).
+- Signing in at the physical greeter evicts the RDP user immediately.
 - Whoever authenticates last wins, just like Windows console session
   takeover.
 
-It is a thin orchestration layer on top of well-known FOSS components
-(`xrdp`, `x11vnc`, `xinput`, `chvt`, `loginctl`). No forks, no patches
-to upstream. Tested on Ubuntu / Kubuntu 24.04+ with Xorg.
+ConsoleRDP is a thin orchestration layer on top of:
 
-> **Status:** alpha. Works on Xorg sessions only. Wayland is not yet
-> supported because there is no portable way to attach a remote
-> framebuffer to an arbitrary running Wayland compositor; see
-> `docs/ARCHITECTURE.md` for the road map.
+- **KDE's `krdpserver`** (patched for NLA, color range, Plasma clipboard)
+- **KDE's `kpipewire`** (patched for BT.601 color + correct H.264 VUI metadata)
+- **`consolerdp-daemon`** — a ~1000-line Python daemon that drives VT
+  switching, xinput lockdown, session lock/unlock, and connection-state
+  detection via `/proc/net/tcp`.
 
----
-
-## How it differs from stock xrdp
-
-| Behavior                               | Stock xrdp | ConsoleRDP |
-| -------------------------------------- | :--------: | :--------: |
-| Spawns a *new* X session on RDP login  |     ✔      |     ✘      |
-| Attaches to the user's *live* `:0`     |     ✘      |     ✔      |
-| Local console keeps the desktop visible during RDP | ✔ |  ✘   |
-| Local console is locked / hidden       |     ✘      |     ✔      |
-| Multiple simultaneous sessions allowed |     ✔      |     ✘      |
-| RDP password = system password         |     ✔      |     ✔      |
+> **Status:** Working for single-user Kubuntu 26.04 LTS. Not yet packaged for
+> other distros. See [INSTALL.md](INSTALL.md) for compatibility details.
 
 ---
 
-## Quick install (Kubuntu / Ubuntu 24.04+)
+## Why this project exists
+
+Stock options all have friction:
+
+| Tool | Problem |
+|------|---------|
+| `xrdp` | Spawns a *new* X session per connection; ignores the live Plasma session. No NLA. |
+| `krdpserver` alone | Works but has no disconnect/takeover logic. The physical screen keeps showing the user's desktop while someone else RDPs in. No auto-unlock. No VT switching. Washed-out colors on mstsc (BT.709 mismatch, limited/full range confusion). |
+| `vino` / `x11vnc` | VNC, not RDP. No NLA. Doesn't integrate with mstsc's credential prompt. |
+| `NoMachine`, `AnyDesk` | Proprietary, third-party servers. |
+
+ConsoleRDP fixes the gaps around `krdpserver`: takeover semantics, VT
+management, session lock, auto-unlock, and color correctness for mstsc.
+
+---
+
+## How it differs from stock `krdpserver`
+
+| Behavior | Stock krdpserver | ConsoleRDP |
+|----------|:---:|:---:|
+| RDP connects to the live Plasma session | ✔ | ✔ |
+| Physical monitor hides desktop during RDP | ✘ | ✔ (greeter on tty8) |
+| Physical monitor reclaims on disconnect | ✘ | ✔ (lockscreen on tty2) |
+| Auto-unlock mstsc reconnect | ✘ | ✔ (NLA-validated) |
+| Local login evicts the RDP user | ✘ | ✔ (`VtMonitor`) |
+| Mstsc shows `#000000` as pure black | ✘ (lifted blacks) | ✔ (BT.601 patch) |
+| Works with mstsc's NLA prompt | ✘ without patch | ✔ |
+| Plasma clipboard bridge (CTRL+C/V across mstsc) | ✘ | ✔ |
+| Disconnect debounce (no phantom release on NLA) | n/a | ✔ |
+
+---
+
+## Install
+
+See [INSTALL.md](INSTALL.md) for the full compatibility matrix and manual steps.
+
+Quick version on a clean Kubuntu 26.04 LTS box:
 
 ```bash
-git clone https://github.com/<you>/consolerdp.git
+git clone https://github.com/billsecond/consolerdp.git
 cd consolerdp
 sudo ./install.sh --user $(whoami)
 ```
 
-The installer is **fully non-interactive** (no debconf / needrestart prompts) and:
+Then on Windows, open **mstsc** and connect to your Linux host on port 3389
+with your Linux password.
 
-1. `apt install` the runtime: `xrdp x11vnc xinput kbd python3 socat`.
-2. If `/usr/share/xsessions` is empty (Plasma 6 on Kubuntu 26.04 is
-   Wayland-only by default), it pulls in `plasma-session-x11` and
-   `kwin-x11` so an X11 session is available at SDDM.
-3. Drops our config into `/etc/xrdp/`, `/etc/pam.d/`, `/etc/consolerdp/`.
-4. Installs `consolerdp-daemon`, `consolerdp-doctor`, etc. into
-   `/usr/local/sbin/`.
-5. Generates a 256-bit random `vnc.passwd` (root:xrdp, mode 0640).
-6. Adds the seat user to `xrdp` and `ssl-cert` groups.
-7. Drops a per-user XDG autostart entry that calls
-   `consolerdp-ctl reclaim` on KDE/GNOME login (so logging in locally
-   automatically kicks the remote session).
-8. Enables a banner agetty (`consolerdp-greeter@tty8`) on the displaced
-   TTY so the local user sees a "session in use remotely" prompt when
-   RDP has the seat.
-9. Sets the seat user's default SDDM session to X11
-   (`/var/lib/sddm/state.conf` + `~/.dmrc`).
-10. Opens UFW for tcp/3389 if UFW is active.
-11. Enables `consolerdp.service` and restarts `xrdp.service`.
-12. Runs `consolerdp-doctor` and prints a green/yellow/red preflight
-    report.
+---
 
-After install, RDP to the box on port **3389** as the configured user.
+## Architecture
 
-To remove cleanly:
+```
+                              Windows (mstsc)
+                                   │
+                    TCP/3389, TLS + NLA (CredSSP)
+                                   │
+        ┌──────────────────────────▼────────────────────────────┐
+        │  krdpserver (patched)    -- systemd --user service    │
+        │    • NLA auth against PAM                             │
+        │    • Forwards mstsc inputs via Plasma fake-input      │
+        │    • Creates a KRDP-virtual-N Wayland output          │
+        └──────┬──────────────────────────────┬─────────────────┘
+               │ (creates output)             │ (streams frames)
+        ┌──────▼───────┐               ┌──────▼──────────────────┐
+        │ KWin         │◄─── kpipewire │ libKPipeWireRecord      │
+        │   Wayland    │     patched   │   (libx264 BT.601 VUI)  │
+        └──────────────┘               └─────────────────────────┘
+                                                │ H.264/AVC
+                                                └──► mstsc (BT.601 YUV→RGB)
 
-```bash
-sudo ./uninstall.sh
+                Seat lifecycle                  consolerdp user
+                (systemd system unit)           (systemd user unit)
+        ┌──────────────────────┐           ┌──────────────────────────┐
+        │ consolerdp.service   │           │ consolerdp-session-      │
+        │   consolerdp-daemon  │           │   watcher.service        │
+        │                      │           │                          │
+        │ • RdpWatcher         │           │ • Polls KWin output list │
+        │   /proc/net/tcp:3389 │           │ • On KRDP-virtual appear:│
+        │   + 3-poll debounce  │           │   claim-screen (move     │
+        │                      │           │   panel + wallpaper)     │
+        │ • KrdpJournalTailer  │           │   + corral-windows       │
+        │   watches krdp       │           │ • On disappear: revert   │
+        │   journal for        │           │                          │
+        │   "auth complete"    │           └──────────────────────────┘
+        │                      │
+        │ • On takeover:       │
+        │   - chvt greeter tty │
+        │   - xinput disable   │
+        │   - unlock-session   │
+        │                      │
+        │ • On release:        │
+        │   - chvt console tty │
+        │   - lock-session     │
+        │   - xinput enable    │
+        │                      │
+        │ • On VT→console:     │
+        │   - restart krdp     │
+        │     user unit        │
+        │     (evicts mstsc)   │
+        └──────────────────────┘
 ```
 
 ---
@@ -87,27 +140,38 @@ sudo ./uninstall.sh
 [seat]
 # The single user permitted to own this seat. Only this user can RDP in
 # and only this user can log in physically.
-user = alice
+user = wdaugherty
 
-# TTY where the live X session lives (SDDM default = tty1 or tty7).
-console_tty = 1
+# TTY where the live Plasma session lives. SDDM on Kubuntu 26.04 uses tty2.
+console_tty = 2
 
-# TTY shown to the displaced side. SDDM will be told to spawn a fresh
-# greeter here on demand.
+# TTY shown to the displaced side (must be different from console_tty).
 greeter_tty = 8
 
+# Password file for the (legacy) x11vnc bridge. Unused by the krdp stack
+# but must exist (empty is fine) for backwards compatibility.
+vnc_passwd_file = /etc/consolerdp/vnc.passwd
+
 [bridge]
-# Address the x11vnc bridge listens on (always loopback in production).
+# Legacy x11vnc settings; ignored by the freerdp/krdp path.
 listen = 127.0.0.1
 port   = 5900
 
+[rdp]
+# TCP port that krdpserver listens on. Change here AND in the krdpserver
+# config if you move it.
+port = 3389
+
+# How often the RdpWatcher polls /proc/net/tcp for connection state.
+watch_interval = 0.5
+
 [policy]
-# When set, a second RDP attempt while one is active is refused.
-# When unset, the new connection wins and the previous RDP is dropped.
+# Refuse a 2nd RDP connect while one is active. If false, the new
+# connection wins and the previous mstsc is dropped.
 single_rdp = true
 
-# Lock the KDE/GNOME session before handing back to the local console
-# (so the user must re-enter the password to resume).
+# Lock the Plasma session on mstsc disconnect. Reconnect auto-unlocks
+# via `loginctl unlock-session`, so this is transparent to the user.
 lock_on_release = true
 ```
 
@@ -116,71 +180,89 @@ lock_on_release = true
 ## Diagnostics
 
 ```bash
-consolerdp-doctor      # prints OK/WARN/FAIL for every precondition
-consolerdp-ctl status  # what does the daemon think it's doing right now?
+sudo consolerdp-doctor        # green/yellow/red preflight check
+consolerdp-ctl status         # live daemon state JSON
 sudo journalctl -u consolerdp.service -f
+journalctl --user -u consolerdp-session-watcher.service -f
 ```
 
-`consolerdp-doctor` checks all installed packages, X11 session
-availability, current `XDG_SESSION_TYPE` (or the seat user's via
-`loginctl` when run under sudo), all four services, the daemon socket
-ping, the TCP/3389 listener, UFW rule presence, and config sanity.
+---
 
-## Security notes
+## Security model
 
-- The xrdp listener authenticates the user via PAM against the host's
-  real account database — RDP password = login password.
-- The x11vnc bridge between xrdp and `:0` is bound to `127.0.0.1` and
-  protected by a 256-bit random password generated at install time
-  (`/etc/consolerdp/vnc.passwd`, mode `0640`, group `xrdp`). It is
-  never reachable from the network.
-- Physical input devices are disabled via `xinput disable` for the
-  duration of every RDP takeover, so even a TTY-switch back to the X
-  session by a local actor cannot interact with the remote desktop.
-- Single-user enforcement is implemented in PAM (`pam_succeed_if`) and
-  reinforced in the daemon — both must agree before a session is
-  granted.
-
-See `docs/ARCHITECTURE.md` for the threat model and trust boundaries.
+- **Auth**: `krdpserver` validates mstsc's NLA credentials against PAM via
+  `/etc/krdpserver/sam`. mstsc password = Linux password. No second prompt.
+- **Seat scope**: only the `user=` in `consolerdp.conf` is allowed to
+  initiate takeover; any other user's mstsc auth is rejected by the daemon.
+- **Input lockdown**: on takeover, every `xinput` device on the seat is
+  disabled so a physical actor at the console can't type into the remote
+  user's active desktop (belt-and-braces, since the VT is also switched
+  to the greeter).
+- **Session lock on disconnect**: the Plasma session is locked the moment
+  mstsc disconnects, so Ctrl+Alt+F2 from the physical console lands on a
+  locked screen. Legitimate reconnect via mstsc auto-unlocks (NLA already
+  passed).
+- **Screencast protection**: the physical `Virtual-1` output is not
+  forcibly disabled (Hyper-V's `hyperv_drm` driver does not honour
+  `kde_output_configuration_v2` disable requests on atomic modeset); instead
+  the VT is switched to the `consolerdp-greeter@tty8` agetty, which
+  displays a "seat in use remotely" banner.
 
 ---
 
 ## Repository layout
 
 ```
-.
-├── bin/                       # Orchestrator executables (Python + shell)
-│   ├── consolerdp-daemon
-│   ├── consolerdp-takeover
-│   └── consolerdp-release
-├── config/                    # Templates dropped under /etc/
-│   ├── consolerdp.conf
-│   ├── xrdp.ini
-│   ├── sesman.ini
-│   ├── startwm.sh
-│   └── pam.d/
-│       └── xrdp-sesman
-├── systemd/                   # Unit files
-│   ├── consolerdp.service
-│   └── consolerdp-vncbridge.service
-├── docs/
-│   └── ARCHITECTURE.md
-├── tests/                     # pytest + shellcheck targets
-├── install.sh
-├── uninstall.sh
-├── Makefile
-├── LICENSE                    # Apache-2.0
-└── README.md
+consolerdp/
+├── bin/                      # Orchestrator + helper scripts (bash + Python)
+│   ├── consolerdp-daemon         # The orchestrator (all the control logic)
+│   ├── consolerdp-ctl            # CLI to talk to the daemon socket
+│   ├── consolerdp-configure      # Post-install wizard
+│   ├── consolerdp-doctor         # Preflight / diagnostic
+│   ├── consolerdp-session-watcher # Per-user systemd watcher (Plasma-side)
+│   ├── consolerdp-claim-screen   # Move panel + wallpaper to KRDP virtual
+│   ├── consolerdp-corral-windows # Pull windows onto the KRDP virtual
+│   ├── consolerdp-output         # KWin output enable/disable via KF6 dbus
+│   └── ... (16 total)
+├── systemd/
+│   ├── consolerdp.service        # Main orchestrator system unit
+│   ├── consolerdp-greeter@.service # Greeter agetty on tty8
+│   └── user/
+│       └── consolerdp-session-watcher.service
+├── config/
+│   ├── consolerdp.conf           # Default config template
+│   └── autostart/                # XDG autostart for per-user watcher
+├── patches/
+│   ├── krdp/     0001..0009      # 8 functional patches on krdp 6.6.4
+│   └── kpipewire/0001            # BT.601 color patch
+├── packaging/
+│   └── consolerdp/debian/        # Debian packaging for the consolerdp .deb
+├── release/                      # Prebuilt .debs (generated by build)
+├── tests/
+│   └── smoke.py                  # 10 unit tests; `make test`
+├── install.sh                    # Top-level installer
+├── uninstall.sh                  # Removal
+├── INSTALL.md                    # Detailed install + compatibility
+├── README.md                     # This file
+└── LICENSE                       # Apache 2.0
 ```
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. Run `make lint test` before submitting.
-The project follows [Conventional Commits](https://www.conventionalcommits.org/).
+Bug reports and PRs welcome on [GitHub](https://github.com/billsecond/consolerdp).
+
+Before submitting:
+
+```bash
+python3 tests/smoke.py  # all 10 tests must pass
+make lint               # shellcheck + ruff if installed
+```
 
 ## License
 
-Apache 2.0. ConsoleRDP composes (does not vendor) GPL-2.0 components at
-runtime; see `LICENSE` for the full notice.
+Apache 2.0. See [LICENSE](LICENSE).
+
+The bundled patches against `krdp` and `kpipewire` are Apache 2.0 / LGPL-2.1
+respectively — both compatible, licenses retained per upstream.

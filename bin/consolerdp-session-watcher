@@ -1,0 +1,207 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-session-watcher -- auto-claim the KRdp virtual output the
+# moment mstsc connects, auto-revert the moment it disconnects.
+#
+# WHY
+# ---
+# Plasma's containment management creates a fresh (blank wallpaper,
+# no panel) containment for every new Wayland output, and mstsc's
+# virtual is no exception. Without intervention, the user sees an
+# empty default desktop inside mstsc with no launcher and no way to
+# escape -- KRunner pops on the invisible physical screen because the
+# KRDP virtual has no panel anchoring "activity". Running
+# consolerdp-claim-screen by hand works, but the user can't reach a
+# shell from inside the wedged mstsc window, so the fix has to be
+# automatic and happen before the user sees anything.
+#
+# This watcher polls the KDE output list once a second. When a
+# KRDP-virtual-* output appears, it:
+#
+#   1. Runs consolerdp-claim-screen to move the Plasma panel and
+#      wallpaper config onto the new virtual.
+#   2. Starts consolerdp-corral-windows --watch in the background to
+#      pull every currently-open and future window onto the virtual.
+#
+# When the KRDP virtual disappears (mstsc disconnect, KRdp teardown),
+# it stops the corral watcher and runs consolerdp-claim-screen
+# --revert to move the panel back to screen 0 so the user regains a
+# panel on their physical display.
+#
+# Install as a systemd user unit; see
+# systemd/user/consolerdp-session-watcher.service in this repo.
+#
+# Logs to stdout (captured by journald when run as a systemd unit);
+# prefix every line so journalctl -u shows clean output.
+
+set -u
+
+LOG() { printf '%s consolerdp-session-watcher: %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+OUTPUT_TOOL="${CONSOLERDP_OUTPUT:-/usr/bin/consolerdp-output}"
+CLAIM="${CONSOLERDP_CLAIM:-/usr/bin/consolerdp-claim-screen}"
+CORRAL="${CONSOLERDP_CORRAL:-/usr/bin/consolerdp-corral-windows}"
+
+# Dev fallback: if the installed copies are missing but the watcher
+# is being invoked from inside a checkout (SCRIPT_DIR resolves to
+# the repo's bin/), use the repo copies. This lets `bin/consolerdp-
+# session-watcher` work without `make install` while developing.
+# The .deb ships the installed paths, so this branch never fires in
+# production.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fallback() {
+    local var=$1 installed=$2 repo=$3
+    if [[ ! -x "$installed" && -x "$repo" ]]; then
+        eval "$var=\"$repo\""
+        LOG "falling back to repo: $repo"
+    fi
+}
+fallback OUTPUT_TOOL "$OUTPUT_TOOL" "$SCRIPT_DIR/consolerdp-output"
+fallback CLAIM       "$CLAIM"       "$SCRIPT_DIR/consolerdp-claim-screen"
+fallback CORRAL      "$CORRAL"      "$SCRIPT_DIR/consolerdp-corral-windows"
+
+for tool in "$OUTPUT_TOOL" "$CLAIM" "$CORRAL"; do
+    if [[ ! -x "$tool" ]]; then
+        LOG "FATAL: missing $tool"; exit 1
+    fi
+done
+
+state=absent
+corral_pid=
+
+cleanup() {
+    # Same rationale as on_disappear(): use SIGKILL to avoid a stalling
+    # qdbus6 call in the child's SIGTERM trap while KWin is torn down.
+    if [[ -n "$corral_pid" ]] && kill -0 "$corral_pid" 2>/dev/null; then
+        LOG "killing corral watcher pid=$corral_pid"
+        kill -9 "$corral_pid" 2>/dev/null || true
+    fi
+    # Safety net: if the watcher dies (logout, service stop, crash)
+    # while the KRDP virtual was active, we've left the physical
+    # outputs disabled -- the user would come back to a black host
+    # monitor. Always re-enable on exit.
+    if [[ "$state" == present ]]; then
+        "$OUTPUT_TOOL" enable-physical >>/tmp/consolerdp-output.log 2>&1 || true
+        LOG "safety: physical outputs re-enabled on cleanup"
+    fi
+}
+trap 'cleanup; exit 0' EXIT INT TERM HUP QUIT
+
+# Detect the KRDP virtual by connector name pattern. KWin prefixes
+# the wl_output name with "Virtual-" so the live name looks like
+# "Virtual-KRDP-virtual-1920x1080"; we match "KRDP-virtual-" so both
+# forms work across KWin versions.
+current_krdp() {
+    "$OUTPUT_TOOL" list 2>/dev/null \
+      | awk '/ENABLED/ && $1 ~ /KRDP-virtual-/ { print $1; exit }'
+}
+
+on_appear() {
+    local name="$1"
+    LOG "KRDP virtual appeared: $name"
+    # Plasma needs a beat after KWin exposes the output to register it
+    # via kde_output_device_v2 and create the containment. Claim loops
+    # internally for ~5s waiting for screenForConnector to resolve.
+    if "$CLAIM"; then
+        LOG "claim-screen ok"
+    else
+        LOG "claim-screen FAILED (rc=$?)"
+    fi
+    # Corral in watch mode so newly-opened windows follow too.
+    "$CORRAL" --watch >>/tmp/consolerdp-corral.log 2>&1 &
+    corral_pid=$!
+    LOG "started corral --watch pid=$corral_pid"
+    # Pre-existing windows that were already on Virtual-1 may take a
+    # beat for KWin to settle their output binding after the new
+    # virtual appears. Run the one-shot corral two more times at
+    # increasing delays to sweep up anything the initial corralAll()
+    # missed. After the second sweep the virtual-monitor contents are
+    # settled, so THAT's when we disable the physical outputs -- doing
+    # it earlier risks Plasma/KWin rebinding the panel or windows back
+    # to Virtual-1 mid-migration.
+    (
+        sleep 2;  "$CORRAL" >>/tmp/consolerdp-corral.log 2>&1 || true
+        sleep 4;  "$CORRAL" >>/tmp/consolerdp-corral.log 2>&1 || true
+        # Security: blank the physical output so Ctrl+Alt+F2 / VT
+        # switch / screen-lock cannot flash the RDP framebuffer on
+        # the host's monitor. disable-physical leaves the KRDP
+        # virtual alone and flips every non-KRDP output off. The
+        # panel and windows are already on the KRDP virtual by now,
+        # so there's nothing to lose.
+        if "$OUTPUT_TOOL" disable-physical >>/tmp/consolerdp-output.log 2>&1; then
+            LOG "physical outputs disabled (VT-flash fix)"
+        else
+            LOG "disable-physical FAILED (rc=$?)"
+        fi
+        LOG "corral safety sweeps done" >&2
+    ) &
+}
+
+on_disappear() {
+    LOG "KRDP virtual disappeared"
+    # FIRST: re-enable the physical outputs we blanked in on_appear().
+    # Everything else (rescue, revert) needs Virtual-1 back, so this
+    # must happen before anything that talks to KWin. enable-physical
+    # is a no-op if they were never disabled.
+    if "$OUTPUT_TOOL" enable-physical >>/tmp/consolerdp-output.log 2>&1; then
+        LOG "physical outputs re-enabled"
+    else
+        LOG "enable-physical FAILED (rc=$?)"
+    fi
+    # SIGKILL rather than SIGTERM-and-wait. The corral --watch script's
+    # SIGTERM trap calls `qdbus6 unloadScript` which talks to KWin --
+    # and KWin is exactly what's busy right now (tearing down the
+    # vanished virtual output). That qdbus call can stall for ~25s
+    # on Qt DBus default timeout, during which the user sees no panel
+    # or windows on their physical display. SIGKILL skips the trap and
+    # returns immediately; KWin garbage-collects the loaded script
+    # on its own when the client goes away.
+    if [[ -n "$corral_pid" ]] && kill -0 "$corral_pid" 2>/dev/null; then
+        kill -9 "$corral_pid" 2>/dev/null || true
+        LOG "killed corral watcher pid=$corral_pid"
+    fi
+    corral_pid=
+    # Pull windows back to the physical screen FIRST, before the panel
+    # revert. If we revert the panel first, plasmashell may resize/redraw
+    # and queue events that conflict with the window moves. Order matters:
+    # rescue windows -> revert panel -> the user sees a populated desktop.
+    if "$CORRAL" --rescue; then
+        LOG "corral --rescue ok"
+    else
+        LOG "corral --rescue FAILED (rc=$?)"
+    fi
+    if "$CLAIM" --revert; then
+        LOG "claim-screen --revert ok"
+    else
+        LOG "claim-screen --revert FAILED (rc=$?)"
+    fi
+    # Schedule a follow-up rescue/revert pass 2s later. KWin sometimes
+    # rebinds windows to the disappearing output during teardown (the
+    # output is still in workspace.screens for ~1s); a second pass after
+    # things settle catches the stragglers.
+    (
+        sleep 2
+        "$CORRAL" --rescue >>/tmp/consolerdp-corral.log 2>&1 || true
+        "$CLAIM" --revert  >>/tmp/consolerdp-claim.log   2>&1 || true
+        LOG "follow-up rescue/revert done" >&2
+    ) &
+}
+
+LOG "started, polling $OUTPUT_TOOL once per second"
+
+while :; do
+    sleep 1
+    name="$(current_krdp || true)"
+    if [[ -n "$name" ]]; then
+        if [[ "$state" == absent ]]; then
+            on_appear "$name"
+            state=present
+        fi
+    else
+        if [[ "$state" == present ]]; then
+            on_disappear
+            state=absent
+        fi
+    fi
+done

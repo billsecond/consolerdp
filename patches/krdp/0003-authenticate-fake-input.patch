@@ -1,0 +1,63 @@
+Description: Call org_kde_kwin_fake_input::authenticate so KWin dispatches
+ button and keyboard events.
+ .
+ The org_kde_kwin_fake_input protocol requires a client to send an
+ ``authenticate(application, reason)`` request before the compositor
+ will dispatch any "dangerous" synthetic input -- specifically, button
+ presses, keyboard keys, touch events, and axis (scroll) events.
+ Pointer motion (including pointer_motion_absolute) is dispatched
+ without authentication as a legacy compatibility concession: it is
+ what lets kdeconnect's mouse-pad interface show a cursor hint without
+ any user-visible permission prompt.
+ .
+ KRdp 6.6.4's PlasmaScreencastV1Session constructs its ``FakeInput``
+ QWaylandClientExtension instance, asserts ``isActive()``, and
+ immediately starts feeding input from the RDP client through
+ ``pointer_motion_absolute``, ``button``, ``keyboard_key``, and
+ ``axis``. Because the ``authenticate`` request is never sent, KWin
+ flags the underlying ``FakeInputDevice`` as unauthenticated and
+ silently drops button/key/axis events while still honouring pointer
+ motion. The visible symptom in mstsc is precisely that: the remote
+ cursor follows the user's mouse, but clicks never register and the
+ keyboard appears dead.
+ .
+ This patch sends ``authenticate("KRdp", "Remote Desktop Input")``
+ immediately after the FakeInput client extension binds, which makes
+ KWin mark our device as authenticated before the first ``button`` or
+ ``keyboard_key`` request arrives. The ``application`` string matches
+ the ConsoleRDP convention of using "KRdp" for user-visible banners;
+ the ``reason`` string is what a future KWin auth-prompt dialog would
+ show to the user if KDE ever decides to re-enforce interactive
+ authorization.
+ .
+ Note on the location of the call. The FakeInput constructor runs
+ ``initialize()`` then ``Q_ASSERT(isActive())`` to make sure the
+ wayland registry contains ``org_kde_kwin_fake_input``; we issue the
+ ``authenticate`` request immediately after FakeInput is constructed
+ in the Session constructor rather than inside FakeInput itself, so
+ the protocol string ("KRdp" / "Remote Desktop Input") stays in one
+ place that obviously identifies this server rather than being buried
+ in a utility class.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-04-30
+Bug-KDE: not-yet (intent to file at https://bugs.kde.org/ once tested)
+
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -163,6 +163,15 @@ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
+     , d(std::make_unique<Private>())
+ {
+     d->remoteInterface = new FakeInput();
++    // org_kde_kwin_fake_input requires an authenticate() request
++    // before KWin will dispatch button, keyboard_key, axis, or touch
++    // events. Pointer motion is exempt (legacy compat), which is why
++    // the mstsc cursor moves while clicks and keystrokes are silently
++    // dropped without this call. See
++    // /usr/share/plasma-wayland-protocols/fake-input.xml for the
++    // protocol description.
++    d->remoteInterface->authenticate(QStringLiteral("KRdp"),
++                                     QStringLiteral("Remote Desktop Input"));
+ }
+ 
+ PlasmaScreencastV1Session::~PlasmaScreencastV1Session()

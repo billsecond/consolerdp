@@ -1,0 +1,133 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-rdp-wrapper — env discovery + freerdp-shadow-cli launcher.
+#
+# Runs as the seat user (UID 1000 on a typical Kubuntu desktop).
+# Discovers the live X11 session's Xauthority via /proc inspection
+# (the same trick the old Xvnc shim used) and execs FreeRDP's shadow
+# server with NLA + SAM-file authentication.
+#
+# Lifecycle is owned by consolerdp-daemon: it `systemctl start`s us
+# when the seat user has an X11 session, `systemctl stop`s us
+# otherwise. We deliberately do NOT use systemd ConditionPath / poll
+# loops here — the daemon already tracks session state and is the
+# single source of truth.
+
+set -u -o pipefail
+
+LOG_TAG="consolerdp-rdp"
+
+log() {
+    /usr/bin/logger -t "$LOG_TAG" -- "$*" 2>/dev/null || echo "$*" >&2
+}
+
+die() {
+    log "FATAL: $*"
+    exit 1
+}
+
+# --------------------------------------------------------------------------- #
+# 1. Discover the live X11 :0 Xauthority.
+# --------------------------------------------------------------------------- #
+# Read /proc/<pid>/cmdline for any Xorg/Xwayland owned by us and
+# extract its `-auth FILE` argument. SDDM (and gdm in some configs)
+# pass a per-session random path like /run/user/1000/xauth_AbCdEf
+# which is the *only* file that grants access to display :0.
+xauthority=""
+my_uid=$(/usr/bin/id -u)
+for pid_dir in /proc/[0-9]*; do
+    [ -r "$pid_dir/cmdline" ] || continue
+    # Match by uid: the X server runs as the seat user.
+    proc_uid=$(/usr/bin/stat -c %u "$pid_dir" 2>/dev/null)
+    [ "$proc_uid" = "$my_uid" ] || continue
+    cmdline=$(/usr/bin/tr '\0' ' ' <"$pid_dir/cmdline" 2>/dev/null) || continue
+    # Argv0 must be Xorg or Xwayland.
+    case "$cmdline" in
+        */Xorg\ *|*/Xwayland\ *|"X "*|*/X\ *) ;;
+        *) continue ;;
+    esac
+    # Extract the value following "-auth ".
+    auth_arg=$(echo "$cmdline" | /usr/bin/sed -nE 's/.*-auth ([^ ]+).*/\1/p')
+    if [ -n "$auth_arg" ] && [ -r "$auth_arg" ]; then
+        xauthority="$auth_arg"
+        break
+    fi
+done
+
+if [ -z "$xauthority" ]; then
+    # Fall back to /run/user/$UID/xauth_* glob.
+    for f in /run/user/"$my_uid"/xauth_*; do
+        if [ -r "$f" ]; then
+            xauthority="$f"
+            break
+        fi
+    done
+fi
+
+if [ -z "$xauthority" ]; then
+    die "no readable Xauthority found for uid=$my_uid; \
+is an Xorg session active?"
+fi
+
+log "discovered XAUTHORITY=$xauthority"
+export XAUTHORITY="$xauthority"
+export DISPLAY=":0"
+
+# --------------------------------------------------------------------------- #
+# 2. Sanity-check we can actually open :0 before launching shadow-cli.
+# --------------------------------------------------------------------------- #
+if ! /usr/bin/xset q >/dev/null 2>&1; then
+    die "cannot open DISPLAY=:0 with XAUTHORITY=$xauthority — \
+X server is not accepting our auth"
+fi
+log "X11 connectivity confirmed (xset q ok)"
+
+# --------------------------------------------------------------------------- #
+# 3. Validate the SAM file exists and is readable. Without it, NLA
+#    rejects everyone and mstsc shows a confusing 'auth failed' dialog.
+# --------------------------------------------------------------------------- #
+SAM_FILE="${CONSOLERDP_SAM_FILE:-/etc/consolerdp/sam}"
+if [ ! -r "$SAM_FILE" ]; then
+    die "SAM file $SAM_FILE not readable by uid=$my_uid. \
+Run: sudo /usr/local/sbin/consolerdp-rdp-cred --user $(id -un) --owner root:$(id -gn) --mode 0640"
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. exec freerdp-shadow-cli.
+# --------------------------------------------------------------------------- #
+# Flag rationale:
+#   /port:3389              standard RDP port
+#   /sec:nla                force NLA (no fallback to plain TLS); this
+#                           is what makes mstsc skip the server-side
+#                           login dialog
+#   /sam-file:…             credentials database for NLA validation
+#   /max-connections:1      single-session: refuse 2nd concurrent
+#                           connect (matches our "kick old, accept new"
+#                           UX — see eventer for the kick logic)
+#   /bind-address:0.0.0.0   listen on all interfaces; ufw scopes it
+#   +bitmap-compat          works around a Windows 11 24H2 client bug
+#                           where bitmap updates with multiple rects
+#                           cause a black screen on the client
+#   /log-level:INFO         needed for the eventer to parse connect/
+#                           disconnect log lines
+#   stdbuf -oL              line-buffer stdout so journald sees events
+#                           in real time rather than 8 KiB chunks
+PORT="${CONSOLERDP_RDP_PORT:-3389}"
+BIND="${CONSOLERDP_RDP_BIND:-0.0.0.0}"
+MAXCONN="${CONSOLERDP_RDP_MAXCONN:-1}"
+
+log "launching freerdp-shadow-cli on ${BIND}:${PORT} (sam=$SAM_FILE)"
+# Note: we used to wrap with `stdbuf -oL` so a log-parsing eventer
+# could see lines in real time, but the watcher in consolerdp-daemon
+# polls /proc/net/tcp directly so unbuffering is no longer needed.
+# Dropping stdbuf also avoids tripping over ProtectSystem=strict
+# blocking /tmp writes that stdbuf's libstdbuf shim requires.
+exec /usr/bin/freerdp-shadow-cli \
+    /port:"$PORT" \
+    /bind-address:"$BIND" \
+    /sec:nla \
+    /sam-file:"$SAM_FILE" \
+    /max-connections:"$MAXCONN" \
+    +bitmap-compat \
+    /log-level:INFO

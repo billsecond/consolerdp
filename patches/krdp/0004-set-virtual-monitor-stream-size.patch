@@ -1,0 +1,60 @@
+Description: Record the requested resolution on virtual-monitor screencast streams.
+ .
+ ``Screencasting::createVirtualMonitorStream`` forgot to assign
+ ``stream->d->m_size`` after constructing the new
+ ``ScreencastingStream``, while the sibling ``createRegionStream``
+ (and ``createOutputStream`` via ``QScreen::virtualSize()``) both do
+ set it from their respective inputs. As a result, every consumer
+ that later calls ``stream->size()`` on a virtual-monitor stream gets
+ a default-constructed (invalid) ``QSize`` back.
+ .
+ The most visible victim is ``PlasmaScreencastV1Session::start()``,
+ which on the ``ScreencastingStream::created`` signal copies that
+ size into the abstract session's logical size:
+ .
+     setLogicalSize(d->request->size());
+ .
+ The logical size is then used by ``sendEvent()`` to scale incoming
+ mouse coordinates from the pipewire stream's pixel space to wayland
+ logical coordinates:
+ .
+     auto logicalPosition = QPointF{
+         (position.x() / size().width())  * logicalSize().width(),
+         (position.y() / size().height()) * logicalSize().height(),
+     };
+     d->remoteInterface->pointer_motion_absolute(
+         logicalPosition.x(), logicalPosition.y());
+ .
+ With ``logicalSize()`` returning an invalid ``QSize``, the right-hand
+ multiplications are zero (or negative one, depending on Qt's default
+ ``QSize`` value across versions), and every remote pointer event is
+ sent as ``pointer_motion_absolute(0.0, 0.0)``. The cursor on the
+ KWin side ends up pinned to the top-left of the screen, which on a
+ default Plasma desktop is the upper-left hot corner -- the trigger
+ for the Overview ("Present Windows") effect. That makes the symptom
+ *very* spectacular when an mstsc user moves the mouse: the cursor
+ appears to jump to the corner repeatedly, Overview keeps activating,
+ and clicks land on whatever ends up under (0,0) (or nothing at all),
+ which mostly means clicks are silently dropped.
+ .
+ The fix is a one-line analogue of the assignment in
+ ``createRegionStream``: store the resolution we just asked the
+ compositor for, so that downstream callers get a sensible size.
+ The dpr argument is intentionally not folded into m_size: m_size is
+ documented as the logical (device-independent) extent of the stream
+ and the dpr is reported separately if a caller needs it.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-04-30
+Bug-KDE: not-yet (intent to file at https://bugs.kde.org/ once tested)
+
+--- a/src/screencasting.cpp
++++ b/src/screencasting.cpp
+@@ -147,6 +147,7 @@ ScreencastingStream *Screencasting::createVirtualMonitorStream(const QString &na
+ {
+     auto stream = new ScreencastingStream(this);
+     stream->d->init(d->stream_virtual_output(name, resolution.width(), resolution.height(), wl_fixed_from_double(dpr), mode));
++    stream->d->m_size = resolution;
+     return stream;
+ }
+ 

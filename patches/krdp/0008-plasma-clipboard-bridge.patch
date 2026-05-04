@@ -1,0 +1,118 @@
+Description: Bridge KSystemClipboard <-> KRdp::Clipboard for --plasma sessions.
+ .
+ ``PortalSession`` already wires Wayland's system clipboard to the
+ RDP CLIPRDR channel through ``KSystemClipboard`` (see
+ ``src/PortalSession.cpp`` lines ~99-119 and ``setClipboardData``
+ around line 219). The corresponding ``PlasmaScreencastV1Session``
+ was left with a stub ``setClipboardData`` and no
+ ``KSystemClipboard::changed`` listener, so when krdpserver runs in
+ ``--plasma`` mode (the only mode that works on a TTY-Plasma
+ session because xdg-desktop-portal-kde refuses to authorise an
+ RDP screen-cast against a service that isn't a graphical app),
+ clipboard sync between the host and the RDP client is silently
+ dropped:
+ .
+   * Copying anything in the Plasma session does not reach mstsc.
+   * Copying from inside mstsc does not reach the Plasma session.
+ .
+ The fix is to mirror PortalSession's logic in the Plasma session
+ class. ``KSystemClipboard`` (from KGuiAddons, already linked into
+ KRdp via ``KF6::GuiAddons`` -- see ``src/CMakeLists.txt``) exposes
+ the system selection over ``zwlr_data_control_v1`` /
+ ``ext_data_control_v1`` even when our QGuiApplication has no
+ surface focus, which is required because krdpserver runs in the
+ background of the seat's Plasma session and never owns a window.
+ .
+ Implementation notes:
+ .
+   * The KSystemClipboard handler clones the returned QMimeData
+     before emitting ``clipboardDataChanged``, identically to the
+     portal path. KSystemClipboard explicitly retains ownership of
+     the QMimeData it returns from ``mimeData()``, while the
+     Clipboard receiver calls ``delete d->serverData`` on the
+     pointer it stores -- emitting the original would lead to a
+     double-free.
+   * ``setClipboardData(nullptr)`` is treated as "clear the system
+     clipboard", consistent with PortalSession.
+   * ``QClipboard::Clipboard`` is used as the mode (not
+     ``QClipboard::Selection``) because RDP's CLIPRDR channel maps
+     to the Windows-style explicit clipboard, not the X11 primary
+     selection.
+ .
+ No new dependencies are introduced: KGuiAddons is already a
+ PUBLIC link dependency of the KRdp library and ``<KSystemClipboard>``
+ / ``<QMimeData>`` headers are already available in the include path
+ used by PortalSession.cpp.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-05-01
+Bug-KDE: not-yet
+
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -8,11 +8,15 @@
+ 
+ #include <QGuiApplication>
+ #include <QMouseEvent>
++#include <QMimeData>
+ #include <QQueue>
+ #include <QScreen>
+ #include <QWaylandClientExtensionTemplate>
+ #include <qpa/qplatformnativeinterface.h>
+ 
++#include <KSystemClipboard>
++#include <QClipboard>
++
+ #include <linux/input-event-codes.h>
+ #include <sys/mman.h>
+ #include <xkbcommon/xkbcommon.h>
+@@ -174,6 +178,32 @@ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
+     // protocol description.
+     d->remoteInterface->authenticate(QStringLiteral("KRdp"),
+                                      QStringLiteral("Remote Desktop Input"));
++
++    // Bridge the Wayland system clipboard to the RDP CLIPRDR channel.
++    // PortalSession does the same; this ensures the --plasma code path
++    // also synchronises copy/paste between the host and mstsc.
++    connect(KSystemClipboard::instance(), &KSystemClipboard::changed, this,
++        [this](QClipboard::Mode mode) {
++            if (mode != QClipboard::Clipboard) {
++                return;
++            }
++
++            auto data = KSystemClipboard::instance()->mimeData(mode);
++            if (!data) {
++                return;
++            }
++
++            // KSystemClipboard retains ownership of what it returns;
++            // KRdp::Clipboard's setServerData takes ownership of what
++            // we hand it, so deep-copy the formats to a fresh object.
++            auto newData = new QMimeData();
++            const auto formats = data->formats();
++            for (const auto &format : formats) {
++                newData->setData(format, data->data(format));
++            }
++
++            Q_EMIT clipboardDataChanged(newData);
++        });
+ }
+ 
+ PlasmaScreencastV1Session::~PlasmaScreencastV1Session()
+@@ -307,7 +337,16 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+ 
+ void PlasmaScreencastV1Session::setClipboardData(std::unique_ptr<QMimeData> data)
+ {
+-    Q_UNUSED(data);
++    // Mirror PortalSession::setClipboardData: hand ownership to
++    // KSystemClipboard, or clear the clipboard when the RDP side
++    // has signalled an empty selection.
++    if (data) {
++        KSystemClipboard::instance()->setMimeData(data.release(),
++                                                  QClipboard::Clipboard);
++    } else {
++        KSystemClipboard::instance()->clear(QClipboard::Clipboard);
++    }
+ }
+ 
+ void PlasmaScreencastV1Session::onPacketReceived(const PipeWireEncodedStream::Packet &data)

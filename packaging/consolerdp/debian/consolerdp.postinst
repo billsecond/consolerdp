@@ -1,0 +1,57 @@
+#!/bin/sh
+# postinst -- runs after dpkg has unpacked the files.
+# See "debian-policy 6.6" for the set of arguments this script
+# can receive ("configure", "abort-upgrade", "abort-remove", ...).
+set -e
+
+case "$1" in
+    configure)
+        # Placeholder expansion. On first-time install, the config
+        # file still has `user = changeme`; we leave that alone so
+        # the operator is forced to run `consolerdp-configure` (or
+        # edit by hand) before starting the service. The service
+        # unit refuses to start with user=changeme, so nothing bad
+        # happens if they skip configuration.
+        if [ ! -d /etc/consolerdp ]; then
+            install -d -m 0755 /etc/consolerdp
+        fi
+
+        # Reload systemd so the new units are visible.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+
+        # Print a friendly post-install note exactly once.
+        cat <<'EOF'
+
+ConsoleRDP is installed but NOT yet configured.
+
+Run (as root):
+
+    sudo consolerdp-configure --user $(whoami)
+
+or edit /etc/consolerdp/consolerdp.conf and then:
+
+    sudo systemctl enable --now consolerdp.service
+    sudo systemctl enable --now consolerdp-greeter@tty8.service
+    systemctl --user enable --now consolerdp-session-watcher.service
+
+Verify with:
+
+    sudo consolerdp-doctor
+
+EOF
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

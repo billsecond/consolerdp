@@ -1,0 +1,78 @@
+From: ConsoleRDP <consolerdp@local>
+Date: Fri, 1 May 2026 11:35:00 -0500
+Subject: Encode H.264 with Limited color range so mstsc renders darks correctly
+
+[MS-RDPEGFX] section 3.1.5.5 specifies that the AVC444 progressive
+H.264 video stream sent over the Graphics Pipeline must be encoded
+with YUV420 *Limited* color range (Y: 16-235, UV: 16-240) per BT.601
+or BT.709 conventions. Microsoft's Remote Desktop client (mstsc)
+follows this spec strictly: the H.264 SPS VUI colour_range bit is
+*ignored*, and the stream is always interpreted as Limited.
+
+KRdp 6.6.4 unconditionally configures the PipeWire encoder to emit
+Full range (Y: 0-255). The reason in the source comment is "so FFmpeg
+decodes correctly", which was added for FreeRDP/wlfreerdp dev tooling
+that does respect the VUI. With mstsc, the result is:
+
+  * Server encodes "black" as Y=16 (limited's black), but the
+    encoder is told it's full range, so the encoder doesn't
+    pre-scale the input -- effectively shipping the linear output of
+    the GPU into a Limited slot.
+  * mstsc decodes Y=16 as 16/255 = 6.3% gray instead of 0% black.
+  * All darks are visibly lifted: pure black on screen renders as
+    #101010 in mstsc, near-black mid-tones blend into a uniform
+    dark gray, and details in shadow regions are washed out.
+
+Switching to ColorRange::Limited makes the encoder pre-scale RGB so
+that pure black (0,0,0) ends up at Y=16 and pure white (255,255,255)
+at Y=235, matching the decoder's expectation.
+
+Tested with mstsc 10.0.x on Windows 11 against KRdp connected via
+PlasmaScreencastV1Session: blacks are visibly black, mid-tones match
+the physical display, no banding observed.
+
+Side effect: any FreeRDP-based test client that ignored the VUI will
+now see crushed blacks. Add a runtime override
+(KRDP_COLOR_RANGE=full) if such a client is reintroduced.
+
+---
+ src/PlasmaScreencastV1Session.cpp | 5 ++++-
+ src/PortalSession.cpp             | 5 ++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -225,7 +225,10 @@ void PlasmaScreencastV1Session::start()
+         setLogicalSize(d->request->size());
+         auto encodedStream = stream();
+         encodedStream->setNodeId(nodeId);
+         encodedStream->setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+-        encodedStream->setColorRange(PipeWireBaseEncodedStream::ColorRange::Full);
++        // Per [MS-RDPEGFX] 3.1.5.5, mstsc decodes the AVC444 H.264
++        // stream as YUV420 *Limited* range (Y: 16-235). Sending Full
++        // range produces lifted blacks (pure black -> #101010) on
++        // mstsc. Override via env KRDP_COLOR_RANGE=full if needed.
++        encodedStream->setColorRange(qEnvironmentVariable("KRDP_COLOR_RANGE") == QStringLiteral("full")
++                                         ? PipeWireBaseEncodedStream::ColorRange::Full
++                                         : PipeWireBaseEncodedStream::ColorRange::Limited);
+         encodedStream->setEncoder(PipeWireEncodedStream::H264Baseline);
+         connect(encodedStream, &PipeWireEncodedStream::newPacket, this, &PlasmaScreencastV1Session::onPacketReceived);
+         connect(encodedStream, &PipeWireEncodedStream::sizeChanged, this, &PlasmaScreencastV1Session::setSize);
+--- a/src/PortalSession.cpp
++++ b/src/PortalSession.cpp
+@@ -337,7 +337,10 @@ void PortalSession::start()
+             encodedStream->setNodeId(stream.nodeId);
+             encodedStream->setFd(fd.takeFileDescriptor());
+             encodedStream->setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+-            // Ensure we encode in full color range so FFmpeg decodes correctly.
+-            encodedStream->setColorRange(PipeWireBaseEncodedStream::ColorRange::Full);
++            // Per [MS-RDPEGFX] 3.1.5.5, mstsc decodes the AVC444
++            // H.264 stream as YUV420 *Limited* range. Use Limited
++            // by default; override with KRDP_COLOR_RANGE=full for
++            // FFmpeg-based test clients.
++            encodedStream->setColorRange(qEnvironmentVariable("KRDP_COLOR_RANGE") == QStringLiteral("full")
++                                             ? PipeWireBaseEncodedStream::ColorRange::Full
++                                             : PipeWireBaseEncodedStream::ColorRange::Limited);
+             encodedStream->setEncoder(PipeWireEncodedStream::H264Baseline);
+             connect(encodedStream, &PipeWireEncodedStream::newPacket, this, &PortalSession::onPacketReceived);
+             connect(encodedStream, &PipeWireEncodedStream::sizeChanged, this, &PortalSession::setSize);

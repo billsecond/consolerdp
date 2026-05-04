@@ -1,0 +1,63 @@
+#!/bin/bash
+# /usr/local/sbin/consolerdp-krdp-wrapper
+#
+# Reads the seat user's RDP password from /etc/consolerdp/krdp.passwd
+# (root:root, 0600 — created by `consolerdp-rdp-cred --plain`) and
+# execs `krdpserver` with -u/-p so the password is never visible in
+# `ps` and never written to journald.
+#
+# Why the wrapper exists:
+#
+# * KRdp 6.6.4 ships an `app-org.kde.krdpserver.service` user-level
+#   systemd unit whose ExecStart is just `/usr/bin/krdpserver`.
+#   Plasma's KCM expects to seed credentials into KWallet which the
+#   binary then reads. That works for a graphical desktop user who
+#   sets things up once via System Settings, but it doesn't work
+#   well for an unattended install (no KWallet password to unlock,
+#   no DBUS to a running KWallet daemon at boot).
+#
+# * KRdp's optional PAM auth path is broken on Kubuntu 26.04 +
+#   systemd 257: pam_authenticate returns "Authentication failure"
+#   even when the supplied password is the user's correct Linux
+#   login password (verified independently via
+#   `pamtester login <user> authenticate`).
+#
+# * Hardcoding -p in the unit file would expose the password in
+#   `systemctl --user cat ...` output to the seat user. This wrapper
+#   reads from a root-only file instead, so the password is opaque
+#   to the user it authenticates.
+#
+# This entire layer goes away if/when the krdp KCM gets a
+# command-line seeding option or PAM upstream fixes the auth bug.
+
+set -euo pipefail
+
+PASSWD_FILE="${CONSOLERDP_KRDP_PASSWD_FILE:-/etc/consolerdp/krdp.passwd}"
+USER_NAME="${CONSOLERDP_KRDP_USER:-$(id -un)}"
+CERT="${CONSOLERDP_KRDP_CERT:-/etc/consolerdp/tls/cert.pem}"
+KEY="${CONSOLERDP_KRDP_KEY:-/etc/consolerdp/tls/key.pem}"
+PORT="${CONSOLERDP_KRDP_PORT:-3389}"
+ADDR="${CONSOLERDP_KRDP_ADDR:-0.0.0.0}"
+
+if [[ ! -r "$PASSWD_FILE" ]]; then
+    echo "consolerdp-krdp-wrapper: cannot read $PASSWD_FILE" >&2
+    exit 78  # EX_CONFIG
+fi
+PASSWD=$(< "$PASSWD_FILE")
+PASSWD="${PASSWD//[$'\r\n']}"  # strip any trailing whitespace
+if [[ -z "$PASSWD" ]]; then
+    echo "consolerdp-krdp-wrapper: $PASSWD_FILE is empty" >&2
+    exit 78
+fi
+
+# Pass --plasma so krdpserver uses KWin's native Wayland screencast
+# protocol (zkde_screencast_unstable_v1) instead of the broken xdg-
+# desktop-portal app-id lookup. Only meaningful on a Wayland session.
+exec /usr/bin/krdpserver \
+    --plasma \
+    --address "$ADDR" \
+    --port "$PORT" \
+    --certificate "$CERT" \
+    --certificate-key "$KEY" \
+    -u "$USER_NAME" \
+    -p "$PASSWD"

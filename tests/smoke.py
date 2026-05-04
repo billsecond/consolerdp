@@ -89,6 +89,9 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(o.takeover("alice"), "OK")
         sysd.chvt.assert_called_with(8)
         sysd.xinput_set_all.assert_called()
+        # Auto-unlock the Plasma session so the mstsc reconnect after
+        # a prior lock_on_release does not hit the lockscreen too.
+        sysd.unlock_session.assert_called()
         self.assertTrue(o.state.rdp_active)
         # x11vnc is no longer started by the orchestrator (the Xvnc
         # shim does it per RDP session). Confirm the method is gone
@@ -132,6 +135,56 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(h._dispatch("RELEASE  user=alice"), "OK")
         self.assertTrue(h._dispatch("UNKNOWN").startswith("ERR"))
         self.assertTrue(h._dispatch("TAKEOVER badtoken").startswith("ERR"))
+
+    def test_rdp_watcher_debounces_brief_connection_gaps(self):
+        """mstsc with NLA briefly drops the auth TCP and opens a fresh
+        stream TCP; we must NOT fire release during the gap.
+        """
+        import threading
+        o, _ = _make_orch()
+        o.takeover("alice")  # sets rdp_active = True
+        stop = threading.Event()
+        w = daemon.RdpWatcher(o, stop)
+        # Mock: first poll sees established, then TWO empties, then
+        # re-established. The two empties must NOT fire release.
+        counts = iter([1, 0, 0, 1, 1, 1])
+        w._established_count = lambda: next(counts)
+        calls: list = []
+        o.release = lambda user: (calls.append(user) or "OK")  # type: ignore
+        # Simulate the poll loop body manually (skip sleep).
+        for _ in range(6):
+            live = w._established_count() > 0
+            if live:
+                w._empty_polls = 0
+            elif o.state.rdp_active:
+                w._empty_polls += 1
+                if w._empty_polls >= w.DISCONNECT_DEBOUNCE:
+                    w._empty_polls = 0
+                    o.release(o.cfg.user)
+        self.assertEqual(calls, [],
+                         "release fired during a brief <3-poll gap")
+
+    def test_rdp_watcher_fires_release_after_sustained_disconnect(self):
+        import threading
+        o, _ = _make_orch()
+        o.takeover("alice")
+        stop = threading.Event()
+        w = daemon.RdpWatcher(o, stop)
+        counts = iter([1, 0, 0, 0, 0])  # 4 consecutive empties
+        w._established_count = lambda: next(counts)
+        calls: list = []
+        o.release = lambda user: (calls.append(user) or "OK")  # type: ignore
+        for _ in range(5):
+            live = w._established_count() > 0
+            if live:
+                w._empty_polls = 0
+            elif o.state.rdp_active:
+                w._empty_polls += 1
+                if w._empty_polls >= w.DISCONNECT_DEBOUNCE:
+                    w._empty_polls = 0
+                    o.release(o.cfg.user)
+        self.assertEqual(calls, ["alice"],
+                         "release did not fire after sustained disconnect")
 
 
 if __name__ == "__main__":

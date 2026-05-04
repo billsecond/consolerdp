@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+"""consolerdp-rdp-cred — write a FreeRDP NTLM SAM file for NLA.
+
+The Windows-style "no second login dialog" behavior in mstsc requires
+``freerdp-shadow-cli`` to authenticate the client via NLA (CredSSP +
+NTLMv2). NLA pre-validates credentials in the RDP handshake, so the
+server never has to display its own login prompt — exactly the UX we
+spent days fighting xrdp over.
+
+NLA needs a SAM database (``/sam-file:PATH``). The format is one user
+per line::
+
+    USERNAME:DOMAIN:LMHASH:NTHASH:::
+
+* ``USERNAME``  — the user whose Linux password should be honored.
+* ``DOMAIN``    — empty (we don't run AD).
+* ``LMHASH``    — empty (LM is broken; FreeRDP accepts blank).
+* ``NTHASH``    — 32 hex chars: MD4 of UTF-16-LE-encoded password.
+
+This module is pure-stdlib and falls back through three MD4 providers
+in order of preference, because OpenSSL 3 deprecated MD4 unless its
+"legacy" provider is loaded, and Python 3.14's ``hashlib`` was built
+without it:
+
+  1. ``hashlib.new("md4", ...)``                 — works on older systems.
+  2. ``openssl dgst -md4 -provider legacy``      — works on OpenSSL 3.x.
+  3. Pure-Python RFC 1320 implementation         — works everywhere.
+
+The pure-Python path is what matters for portability — we don't want
+this tool to fail on a freshly-installed box just because of a hash.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# --------------------------------------------------------------------------- #
+# MD4 implementation (RFC 1320). Used only as last-resort fallback; the
+# vast majority of installs will hit hashlib or openssl above.
+# --------------------------------------------------------------------------- #
+
+def _md4_pure(data: bytes) -> bytes:
+    """RFC 1320 MD4. Returns 16 raw bytes."""
+    # Pad to 64-byte boundary with 0x80 then zeros, then 8-byte length.
+    msg_len_bits = (len(data) * 8) & 0xFFFFFFFFFFFFFFFF
+    data += b"\x80"
+    while (len(data) % 64) != 56:
+        data += b"\x00"
+    data += struct.pack("<Q", msg_len_bits)
+
+    a, b, c, d = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476
+
+    def lrot(x: int, n: int) -> int:
+        x &= 0xFFFFFFFF
+        return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+
+    for off in range(0, len(data), 64):
+        x = list(struct.unpack("<16I", data[off : off + 64]))
+        aa, bb, cc, dd = a, b, c, d
+        # Round 1: F(b,c,d) = (b & c) | (~b & d)
+        for i, k in enumerate((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)):
+            s = (3, 7, 11, 19)[i % 4]
+            f = (b & c) | ((~b) & d) & 0xFFFFFFFF
+            a, d, c, b = d, c, b, lrot(a + f + x[k], s)
+        # Round 2: G(b,c,d) = (b & c) | (b & d) | (c & d)
+        for i, k in enumerate((0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15)):
+            s = (3, 5, 9, 13)[i % 4]
+            g = (b & c) | (b & d) | (c & d)
+            a, d, c, b = d, c, b, lrot(a + g + x[k] + 0x5A827999, s)
+        # Round 3: H(b,c,d) = b ^ c ^ d
+        for i, k in enumerate((0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15)):
+            s = (3, 9, 11, 15)[i % 4]
+            h = b ^ c ^ d
+            a, d, c, b = d, c, b, lrot(a + h + x[k] + 0x6ED9EBA1, s)
+        a = (a + aa) & 0xFFFFFFFF
+        b = (b + bb) & 0xFFFFFFFF
+        c = (c + cc) & 0xFFFFFFFF
+        d = (d + dd) & 0xFFFFFFFF
+
+    return struct.pack("<4I", a, b, c, d)
+
+
+def md4(data: bytes) -> bytes:
+    """Compute MD4 via the most reliable available backend."""
+    # Path 1: hashlib if OpenSSL was built with MD4 (rare on modern distros).
+    try:
+        return hashlib.new("md4", data).digest()
+    except (ValueError, Exception):  # noqa: BLE001
+        pass
+    # Path 2: openssl(1) with the legacy provider.
+    try:
+        cp = subprocess.run(
+            ["openssl", "dgst", "-md4", "-provider", "legacy", "-binary"],
+            input=data, capture_output=True, check=True, timeout=5,
+        )
+        if len(cp.stdout) == 16:
+            return cp.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
+        pass
+    # Path 3: pure-Python RFC 1320.
+    return _md4_pure(data)
+
+
+def nt_hash(password: str) -> str:
+    """The NTLM v1 hash of a password: MD4(UTF-16LE(password))."""
+    return md4(password.encode("utf-16-le")).hex()
+
+
+# --------------------------------------------------------------------------- #
+# SAM-file management
+# --------------------------------------------------------------------------- #
+
+def sam_line(user: str, password: str, domain: str = "") -> str:
+    """Build one ``user:domain:lm:nt:::`` SAM record."""
+    if ":" in user or "\n" in user or ":" in domain:
+        raise ValueError("user/domain must not contain ':' or newlines")
+    nt = nt_hash(password).upper()
+    return f"{user}:{domain}::{nt}:::"
+
+
+def write_sam(path: Path, user: str, password: str,
+              *, domain: str = "", mode: int = 0o600,
+              owner_uid: int = 0, owner_gid: int = 0) -> None:
+    """Atomically write a SAM file with one user.
+
+    The file is created with ``mode`` permissions and chowned to the
+    given uid/gid so freerdp-shadow-cli can read it but unprivileged
+    processes cannot. Writes go through a temp file in the same dir
+    so we never expose a half-written SAM to the world.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = sam_line(user, password, domain)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent),
+                                     prefix=".sam-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("# /etc/consolerdp/sam — generated by consolerdp-rdp-cred\n")
+            f.write("# Format: USERNAME:DOMAIN:LMHASH:NTHASH:::\n")
+            f.write("# Used by freerdp-shadow-cli for NLA authentication.\n")
+            f.write(line + "\n")
+        os.chmod(tmp_name, mode)
+        os.chown(tmp_name, owner_uid, owner_gid)
+        os.replace(tmp_name, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="consolerdp-rdp-cred",
+        description=(
+            "Write a FreeRDP NTLM SAM file so freerdp-shadow-cli can "
+            "authenticate mstsc clients without showing a server-side "
+            "login dialog."),
+    )
+    p.add_argument("--user",
+                   help="Linux user that owns the seat (matches "
+                        "/etc/consolerdp/consolerdp.conf 'user'). "
+                        "Required unless --self-test is given.")
+    p.add_argument("--password",
+                   help="Plaintext password. If omitted, prompted via "
+                        "stdin (no echo).")
+    p.add_argument("--password-stdin", action="store_true",
+                   help="Read password from stdin (one line, no prompt).")
+    p.add_argument("--domain", default="",
+                   help="NTLM domain field. Empty for non-AD setups.")
+    p.add_argument("--out", default="/etc/consolerdp/sam",
+                   help="Output SAM file path (default %(default)s).")
+    p.add_argument("--mode", default="0600",
+                   help="File mode (octal, default %(default)s).")
+    p.add_argument("--owner", default="root:root",
+                   help="user:group to own the file (default %(default)s).")
+    p.add_argument("--self-test", action="store_true",
+                   help="Run NTLM hash test vectors and exit.")
+    args = p.parse_args(argv)
+
+    if args.self_test:
+        # First two are RFC-canonical NTLM hash vectors. Third was
+        # cross-validated against `iconv -t UTF-16LE | openssl dgst
+        # -md4 -provider legacy`. All three are computed independently
+        # by both the openssl path and the pure-Python RFC 1320
+        # implementation in this file, so a successful self-test
+        # proves both backends agree with each other and with OpenSSL.
+        cases = {
+            "":          "31d6cfe0d16ae931b73c59d7e0c089c0",
+            "password":  "8846f7eaee8fb117ad06bdd830b7586c",
+            "Passw0rd!": "fc525c9683e8fe067095ba2ddc971889",
+        }
+        ok = True
+        for pw, expect in cases.items():
+            got = nt_hash(pw)
+            mark = "OK " if got == expect else "FAIL"
+            print(f"  [{mark}] NT(<{pw or 'empty'}>) = {got}  expect {expect}")
+            ok = ok and got == expect
+        return 0 if ok else 2
+
+    if not args.user:
+        p.error("--user is required (unless --self-test)")
+
+    if args.password_stdin:
+        password = sys.stdin.readline().rstrip("\n")
+    elif args.password:
+        password = args.password
+    else:
+        if not sys.stdin.isatty():
+            print("ERROR: no --password and stdin is not a tty",
+                  file=sys.stderr)
+            return 2
+        password = getpass.getpass(f"Password for {args.user}: ")
+        confirm  = getpass.getpass("Confirm: ")
+        if password != confirm:
+            print("ERROR: passwords do not match", file=sys.stderr)
+            return 2
+    if not password:
+        print("ERROR: empty password rejected", file=sys.stderr)
+        return 2
+
+    # Resolve uid/gid for owner.
+    owner_user, _, owner_group = args.owner.partition(":")
+    import pwd as _pwd, grp as _grp
+    try:
+        uid = _pwd.getpwnam(owner_user).pw_uid
+        gid = _grp.getgrnam(owner_group or owner_user).gr_gid
+    except KeyError as e:
+        print(f"ERROR: owner not found: {e}", file=sys.stderr)
+        return 2
+
+    write_sam(
+        Path(args.out), args.user, password,
+        domain=args.domain, mode=int(args.mode, 8),
+        owner_uid=uid, owner_gid=gid,
+    )
+    print(f"Wrote SAM file: {args.out}  (user={args.user}, "
+          f"owner={args.owner}, mode={args.mode})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

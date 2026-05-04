@@ -1,0 +1,30 @@
+Description: Enable NLA (Network Level Authentication) so mstsc can prompt for credentials.
+ KRdp 6.6.4 hardcodes FreeRDP_NlaSecurity to false in src/RdpConnection.cpp,
+ which makes the server advertise only plain TLS during RDP security
+ negotiation. Microsoft mstsc enforces NLA-required by default on modern
+ Windows, so the negotiation fails and mstsc never displays its credential
+ prompt. The black-screen flash users see is mstsc completing the TLS
+ handshake, then disconnecting because no usable security mode was offered.
+ .
+ Switching the flag to true makes FreeRDP's server library advertise the
+ HYBRID protocol. mstsc shows its native pre-connection credential dialog,
+ sends the credentials over CredSSP, and KRdp's existing pamAuthenticate
+ path validates them against /etc/pam.d/login. No other code changes
+ needed: pam_conv, pam_start("login", ...), and the rest of the auth
+ chain were already in place; they just couldn't be reached without NLA.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-04-30
+Bug-KDE: not-yet (intent to file at https://bugs.kde.org/ once tested)
+
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -353,7 +353,7 @@
+ 
+     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
+     freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, true);
+-    freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, false);
++    freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, true);
+ 
+     freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
+     // PSEUDO_XSERVER is apparently required for things to work properly.

@@ -1,0 +1,229 @@
+#!/bin/bash
+# Copyright 2026 The ConsoleRDP Authors. Apache-2.0.
+#
+# consolerdp-corral-windows -- relocate every visible Plasma window
+# onto the KRdp virtual output created by an active mstsc session.
+#
+# WHY THIS EXISTS
+# ---------------
+# When the user is on a multi-output Plasma session (their physical
+# Virtual-1 + the KRDP virtual created on mstsc connect + leftover
+# XDP-virtual from xdg-desktop-portal-kde), KWin's window placement
+# isn't aware that the human eyes are looking at the KRDP virtual via
+# mstsc. New windows the user opens from the panel land on whichever
+# screen KWin's Smart placement picks -- typically Virtual-1, since
+# panels and the active screen often anchor there. The user sees the
+# taskbar tile change state but no window appears in mstsc, because
+# the window in fact appeared on a screen they can't see.
+#
+# This helper finds every "normal" window (the same filter Plasma's
+# Task Manager uses -- excludes panels, OSDs, splashes, ...) and
+# centres it on the KRdp virtual output's geometry. It runs synchronously
+# via a temporary KWin script loaded over the
+# org.kde.KWin /Scripting D-Bus API, the same mechanism used by
+# Plasma's "Switch Activity" KCM, so it does not need elevated
+# privileges and works on a locked Plasma Wayland session.
+#
+# USAGE
+#   consolerdp-corral-windows                # corral once (KRDP virtual)
+#   consolerdp-corral-windows --watch        # corral, then watch
+#                                            # workspace.windowAdded
+#                                            # and corral each new
+#                                            # window until killed
+#   consolerdp-corral-windows --rescue       # reverse direction: pull
+#                                            # every window OFF the
+#                                            # KRDP virtual back onto
+#                                            # screen 0 (the physical
+#                                            # output). Used on mstsc
+#                                            # disconnect so windows
+#                                            # don't get orphaned to
+#                                            # a screen that no longer
+#                                            # exists.
+#
+# Requirements: must run as the seat user with XDG_RUNTIME_DIR and
+# DBUS_SESSION_BUS_ADDRESS pointing at the user bus.
+
+set -euo pipefail
+
+WATCH=0
+RESCUE=0
+case "${1:-}" in
+    --watch)  WATCH=1 ;;
+    --rescue) RESCUE=1 ;;
+    "")       ;;
+    *)        echo "unknown arg: $1" >&2; exit 64 ;;
+esac
+
+# Pick a unique kwin script "plugin name" each run so loadScript() never
+# collides with a stale instance from a previous invocation.
+SCRIPT_TAG="consolerdp-corral-$$-$(date +%s%N)"
+TMP_JS="$(mktemp --suffix=.js /tmp/${SCRIPT_TAG}.XXXXXX)"
+
+cat > "$TMP_JS" <<KWINJS
+// Find a KRdp virtual output. KRdp's PlasmaScreencastV1Session creates
+// outputs named "KRDP-virtual-WxH" via zkde_screencast_stream_virtual_output;
+// KWin prefixes them with "Virtual-" on the wl_output side, so we
+// match either form to be safe across KWin versions.
+function findKrdpOutput() {
+    for (var s of workspace.screens) {
+        if (/(^|-)KRDP-virtual-/.test(s.name)) {
+            return s;
+        }
+    }
+    return null;
+}
+
+function corral(window, target) {
+    // Log *every* window we evaluate so we can see what got filtered.
+    var outname = (window.output && window.output.name) ? window.output.name : "(none)";
+    var reason = "";
+    if (!window.normalWindow) reason = "not normalWindow";
+    else if (!window.moveable) reason = "not moveable";
+    // Compare by output *name*, not serialNumber. KWin 6.x hands back
+    // the same empty serialNumber for multiple outputs (virtual outputs
+    // have no EDID), so relying on serial lets pre-existing windows on
+    // Virtual-1 look like they're "already" on the KRDP virtual. Name
+    // is the stable identifier we match on elsewhere.
+    else if (window.output && window.output.name === target.name) reason = "already on " + target.name;
+    if (reason) {
+        console.info("consolerdp-corral: SKIP class=" + window.resourceClass +
+                     " title='" + String(window.caption).slice(0,40) + "'" +
+                     " output=" + outname + " reason=" + reason);
+        return;
+    }
+    console.info("consolerdp-corral: moving class=" + window.resourceClass +
+                 " title='" + String(window.caption).slice(0,40) + "'" +
+                 " from output=" + outname + " -> " + target.name);
+    // Use KWin's sendClientToScreen() so the window's *output binding*
+    // (not just its geometry rectangle) follows. Setting frameGeometry
+    // alone leaves the window logically attached to its old output --
+    // the taskbar entry shows it on the new screen, but Plasma's
+    // window manager still routes activation/focus to the old output,
+    // so clicking the taskbar entry does nothing visible to the user.
+    // sendClientToScreen() updates both screens binding and geometry.
+    if (typeof workspace.sendClientToScreen !== "function") {
+        console.info("consolerdp-corral: ERROR workspace.sendClientToScreen is not a function");
+    } else {
+        workspace.sendClientToScreen(window, target);
+    }
+
+    // After the bind change, also recentre and clamp the window to the
+    // target's geometry. The send-to-screen call moves the window but
+    // tries to preserve relative position; if the source output was
+    // larger or at different coordinates the window can land partially
+    // off-screen on the new output. Recentring fixes that.
+    var g = target.geometry;
+    var w = Math.min(window.frameGeometry.width,  g.width  - 40);
+    var h = Math.min(window.frameGeometry.height, g.height - 40);
+    var x = g.x + Math.max(0, (g.width  - w) / 2);
+    var y = g.y + Math.max(0, (g.height - h) / 2);
+    window.frameGeometry = { x: x, y: y, width: w, height: h };
+
+    console.info("consolerdp-corral: moved " + window.resourceClass +
+                 " '" + window.caption + "' -> " + target.name);
+}
+
+function corralAll() {
+    var target = findKrdpOutput();
+    if (!target) {
+        console.info("consolerdp-corral: no KRdp virtual output present, nothing to do");
+        return;
+    }
+    var list = workspace.windowList();
+    console.info("consolerdp-corral: corralAll target=" + target.name +
+                 " windows.length=" + list.length +
+                 " screens.length=" + workspace.screens.length);
+    for (var w of list) {
+        corral(w, target);
+    }
+}
+
+// Rescue mode: pull every window onto screen 0 (the physical output),
+// regardless of where it currently lives. Used on mstsc disconnect so
+// windows that were corralled onto the now-vanished KRDP virtual end
+// up somewhere the user can actually see and click on.
+function rescueAll() {
+    if (workspace.screens.length === 0) {
+        console.info("consolerdp-corral: no screens at all?!");
+        return;
+    }
+    // Prefer the first non-KRDP-virtual screen. If KRDP virtual is
+    // still in the list (mstsc just disconnected; KWin hasn't torn
+    // it down yet), skip it. Fall back to screen 0.
+    var target = null;
+    for (var s of workspace.screens) {
+        if (!/(^|-)KRDP-virtual-/.test(s.name)) {
+            target = s;
+            break;
+        }
+    }
+    if (!target) {
+        target = workspace.screens[0];
+    }
+    console.info("consolerdp-corral: rescuing all windows -> " + target.name);
+    for (var w of workspace.windowList()) {
+        if (!w.normalWindow || !w.moveable) continue;
+        if (w.output && w.output.name === target.name) continue;
+        workspace.sendClientToScreen(w, target);
+        // Recentre on the rescue screen the same way corral() does.
+        var g = target.geometry;
+        var ww = Math.min(w.frameGeometry.width,  g.width  - 40);
+        var hh = Math.min(w.frameGeometry.height, g.height - 40);
+        var x = g.x + Math.max(0, (g.width  - ww) / 2);
+        var y = g.y + Math.max(0, (g.height - hh) / 2);
+        w.frameGeometry = { x: x, y: y, width: ww, height: hh };
+        console.info("consolerdp-corral: rescued " + w.resourceClass +
+                     " '" + w.caption + "' -> " + target.name);
+    }
+}
+
+if ($RESCUE) {
+    rescueAll();
+} else {
+    corralAll();
+}
+
+if ($WATCH) {
+    workspace.windowAdded.connect(function(w) {
+        var target = findKrdpOutput();
+        if (target) corral(w, target);
+    });
+    workspace.screensChanged.connect(function() {
+        // KRdp virtual may have just appeared; re-corral.
+        corralAll();
+    });
+    // Each window's outputChanged fires when KWin re-evaluates which
+    // output the window logically belongs to. If a window is on the
+    // wrong output (e.g. it ended up back on Virtual-1 after a focus
+    // change), this re-corrals it.
+    for (var i = 0; i < workspace.windowList().length; i++) {
+        (function(w) {
+            if (w.outputChanged && w.outputChanged.connect) {
+                w.outputChanged.connect(function() {
+                    var target = findKrdpOutput();
+                    if (target) corral(w, target);
+                });
+            }
+        })(workspace.windowList()[i]);
+    }
+    console.info("consolerdp-corral: watching for new windows");
+}
+KWINJS
+
+# Load and run the script on the running KWin instance.
+SCRIPT_ID=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$TMP_JS" "$SCRIPT_TAG")
+qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start
+
+if [[ "$WATCH" -eq 0 ]]; then
+    # One-shot mode: give the script time to walk the window list
+    # synchronously, then unload it to keep KWin tidy.
+    sleep 0.3
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$SCRIPT_TAG" >/dev/null 2>&1 || true
+    rm -f "$TMP_JS"
+else
+    # Watch mode: keep the script loaded until we get a signal.
+    trap 'qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$SCRIPT_TAG" >/dev/null 2>&1 || true; rm -f "$TMP_JS"; exit 0' INT TERM
+    # Idle wait. journalctl follows the kwin output if you want to see
+    # what was moved: journalctl --user -f -t kwin_wayland_wrapper | grep consolerdp-corral
+    while sleep 60; do :; done
+fi

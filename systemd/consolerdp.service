@@ -1,6 +1,6 @@
 [Unit]
 Description=ConsoleRDP orchestrator (Windows-style RDP takeover for Linux)
-Documentation=https://github.com/wdaugherty/consolerdp
+Documentation=https://github.com/billsecond/consolerdp
 After=systemd-logind.service network.target
 Wants=systemd-logind.service
 Before=xrdp.service
@@ -8,7 +8,7 @@ PartOf=xrdp.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/consolerdp-daemon \
+ExecStart=/usr/sbin/consolerdp-daemon \
     --config /etc/consolerdp/consolerdp.conf \
     --socket /run/consolerdp.sock \
     --log-level INFO

@@ -1,0 +1,145 @@
+Description: Defer virtual-monitor sizing until peerActivate fires.
+ .
+ Patch ``0002-virtual-monitor-from-client.patch`` introduced a
+ ``--virtual-monitor client`` command-line mode whose
+ ``SessionController::handleNewConnection`` reads
+ ``peer->settings->DesktopWidth/Height`` (via
+ ``RdpConnection::requestedDesktopSize()``) so that KWin's virtual
+ output matches the size mstsc negotiated. The read was hung off the
+ ``stateChanged(State::Running)`` signal on the theory that "by the
+ time our queued-connection handler runs on the main thread, the
+ FreeRDP capability exchange has completed and the settings struct
+ has been populated".
+ .
+ That theory is not true in practice on Kubuntu 26.04 + FreeRDP
+ 3.24.2: ``setState(State::Running)`` is emitted in
+ ``RdpConnection::run()`` *before* the server's main event loop has
+ read a single byte from the client's socket (the ``while (!stopToken)``
+ loop and the very first ``peer->CheckFileDescriptor()`` call both
+ happen strictly after ``setState(Running)``). The queued signal
+ therefore races with the FreeRDP connection-sequence, and in the
+ common case our slot wins the race: the client's MCS Connect-Initial
+ / Demand Active / Confirm Active PDUs haven't been processed yet,
+ ``peer->settings->DesktopWidth/Height`` still hold FreeRDP's internal
+ defaults (``1024x768``), and we create a virtual monitor at
+ ``1024x768`` regardless of what the user picked in mstsc's Display
+ tab.
+ .
+ The user-visible symptom is brutal: every RDP session comes up at
+ 1024x768 no matter what resolution the user selected, and on
+ high-DPI clients (2560x1600, 3840x2160, ...) the streamed frame is
+ unusably small once it's rescaled by the RDP client.
+ .
+ The fix is to use a signal that fires only after FreeRDP's own
+ ``peerActivate`` callback -- i.e. after the client has sent
+ Confirm Active and peer->settings carries its final, negotiated
+ DesktopWidth/Height. We:
+ .
+   * Introduce ``RdpConnection::activated()``, a new Qt signal
+     emitted from ``onActivate()`` (which is invoked from the
+     FreeRDP ``peer->Activate`` callback right after a successful
+     capability-exchange). Emission happens from the worker thread;
+     the receiver's thread affinity determines dispatch semantics
+     just like ``stateChanged``.
+   * Switch ``SessionController::handleNewConnection`` to connect to
+     ``activated()`` instead of ``stateChanged(Running)`` for the
+     ``--virtual-monitor client`` code path.
+ .
+ ``State::Streaming`` would also work in principle (it fires after
+ DRDYNVC_STATE_READY, which is strictly after activation), but it
+ fires inside the run() loop *after* ``VideoStream::setEnabled(true)``
+ -- by which point ``AbstractSession::start()`` has already been
+ queued via the ``VideoStream::enabledChanged`` signal, so setting
+ the virtual monitor at that point is too late. ``activated()`` is
+ the smallest-scope, most specific hook.
+ .
+ This patch only affects the ``--virtual-monitor client`` code path;
+ the explicit-size and no-virtual-monitor branches in
+ ``handleNewConnection`` are unchanged.
+Author: ConsoleRDP <consolerdp@local>
+Forwarded: not-yet
+Last-Update: 2026-05-01
+Bug-KDE: not-yet
+
+--- a/src/RdpConnection.h
++++ b/src/RdpConnection.h
+@@ -75,6 +75,17 @@
+     State state() const;
+     Q_SIGNAL void stateChanged(State newState);
+ 
++    /**
++     * Emitted after FreeRDP has invoked ``peerActivate``, which only
++     * happens once the client has completed the Demand Active /
++     * Confirm Active exchange and ``peer->context->settings`` carries
++     * its final, negotiated values (including DesktopWidth/Height).
++     *
++     * Consumers that want to read fields populated during capability
++     * exchange should prefer this signal over ``stateChanged(Running)``.
++     */
++    Q_SIGNAL void activated();
++
+     /**
+      * Desktop size requested by the RDP client during the FreeRDP
+      * capability exchange (i.e. ``peer->settings->DesktopWidth/Height``).
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -524,6 +524,11 @@ bool RdpConnection::onCapabilities()
+ 
+ bool RdpConnection::onActivate()
+ {
++    // ``peerActivate`` has just fired in the FreeRDP worker thread, so
++    // peer->context->settings is now authoritative for this connection.
++    // Tell anyone listening (notably SessionController, which needs the
++    // real DesktopWidth/Height before it creates the virtual monitor).
++    Q_EMIT activated();
+     return true;
+ }
+ 
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -138,34 +138,29 @@ void SessionController::handleNewConnection(KRdp::RdpConnection *newConnection)
+     auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
+ 
+     if (m_virtualMonitorFromClient) {
+-        // Defer virtual-monitor creation. RdpConnection::stateChanged is
+-        // emitted from its worker thread; the receiver context (the
+-        // session pointer) lives on the main thread, so Qt delivers the
+-        // signal via QueuedConnection. By the time our handler runs in
+-        // the main event loop, peer->settings has been populated by the
+-        // FreeRDP capability exchange but the videoStream has not yet
+-        // been enabled (that happens on the *next* iteration of the
+-        // RdpConnection::run() loop, when DRDYNVC_STATE_READY flips).
+-        // That gives us a safe window to call setVirtualMonitor() before
+-        // session->start() is dispatched downstream of
+-        // VideoStream::enabledChanged.
++        // Defer virtual-monitor creation until FreeRDP has processed
++        // the client's Demand Active / Confirm Active PDUs. Using
++        // ``activated()`` rather than ``stateChanged(Running)`` is
++        // load-bearing: ``setState(Running)`` is emitted *before* the
++        // run() loop reads anything from the socket, so at that point
++        // peer->settings still holds FreeRDP's compiled-in defaults
++        // (1024x768), not what mstsc negotiated. The ``activated``
++        // signal is emitted from ``peerActivate``, which fires only
++        // after capability exchange is complete.
+         auto *session = wrapper->session.get();
+-        QObject::connect(newConnection, &KRdp::RdpConnection::stateChanged, session,
+-            [session, newConnection](KRdp::RdpConnection::State state) {
+-                if (state != KRdp::RdpConnection::State::Running) {
+-                    return;
+-                }
++        QObject::connect(newConnection, &KRdp::RdpConnection::activated, session,
++            [session, newConnection]() {
+                 QSize size = newConnection->requestedDesktopSize();
+                 if (!size.isValid()) {
+                     qWarning() << "krdpserver: client did not advertise a "
+                                   "desktop size in MCS Connect-Initial; "
+                                   "falling back to 1920x1080";
+                     size = QSize(1920, 1080);
+                 }
+                 const QString name = QStringLiteral("KRDP-virtual-%1x%2")
+                                          .arg(size.width()).arg(size.height());
+                 qInfo() << "krdpserver: creating virtual monitor at "
+                            "client-requested size" << size;
+                 session->setVirtualMonitor({name, size, 1.0});
+             });
+     } else if (m_virtualMonitor) {
